@@ -1,0 +1,21 @@
+# Entorno virtual
+venv/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Datos satelitales crudos pesados
+data/raw/
+*.nc
+*.h5
+*.hdf
+*.he5
+
+# Archivos temporales
+.DS_Store
+*.log
+
+# Variables/credenciales
+.env
