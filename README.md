@@ -1,4 +1,4 @@
-# LANOT - Detección de SO2
+# LANOT - Detección de SO2 y ASH
 
 Proyecto para análisis de datos satelitales (Sentinel-5P) enfocado en detección de SO₂.
 
