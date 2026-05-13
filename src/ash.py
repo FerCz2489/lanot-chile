@@ -17,8 +17,9 @@ from pyproj import CRS, Transformer
 # CONFIGURACIÓN GENERAL
 # ==========================================================
 
-INPUT_BASE = "/home/fercz/lanot/data/raw/GOES"
-OUTPUT_BASE = "/home/fercz/lanot/data/outputs/rgb_ash"
+# Ajusta estas rutas según la computadora donde ejecutes el script
+INPUT_BASE = "/mnt/d/raw/GOES"
+OUTPUT_BASE = "/mnt/d/rgb_ash"
 
 # Para eventos históricos de Chile:
 BUCKET_GOES = "noaa-goes16"
@@ -26,34 +27,70 @@ BUCKET_GOES = "noaa-goes16"
 # Producto ABI Full Disk, canal individual por archivo
 PRODUCTO_GOES = "ABI-L2-CMIPF"
 
-# Incluye C07 para el RGB microfísica/Pavolonis
-BANDAS_REQUERIDAS = ["C07", "C11", "C13", "C14", "C15"]
-
-EVENTOS = [
-    "2019-03-08",
-    "2020-01-30",
-    "2020-04-08",
-    "2022-12-10",
-    "2023-01-27",
+# Todas las bandas ABI para descarga
+BANDAS_DESCARGA = [
+    "C01", "C02", "C03", "C04",
+    "C05", "C06", "C07", "C08",
+    "C09", "C10", "C11", "C12",
+    "C13", "C14", "C15", "C16"
 ]
+
+# Solo las bandas necesarias para los RGB volcánicos actuales
+BANDAS_RGB = ["C07", "C11", "C13", "C14", "C15"]
+
+
+# ==========================================================
+# VOLCANES Y FECHAS POR VOLCÁN
+# ==========================================================
+# IMPORTANTE:
+# Cada volcán TIENE QIE procesar SOLO sus propias fechas, Villarica no tiene pero podemos agregarla cuando me den fechas
 
 VOLCANES = {
     "Chillan": {
         "lat": -36.868,
         "lon": -71.378,
         "bbox": [-73.5, -38.2, -69.8, -35.2],
+        "eventos": [
+            "2019-03-08",
+            "2020-01-30",
+            "2020-04-08",
+        ],
     },
+
     "Lascar": {
         "lat": -23.370,
         "lon": -67.730,
         "bbox": [-70.0, -25.0, -65.5, -21.5],
+        "eventos": [
+            "2022-12-10",
+            "2023-01-27",
+        ],
     },
+
     "Villarrica": {
         "lat": -39.420,
         "lon": -71.930,
         "bbox": [-74.0, -41.0, -70.0, -38.0],
+        "eventos": [
+            # Agrega aquí fechas cuando LAS TENGA con el formato como este ejemplo:
+            # "2023-02-15",
+        ],
     },
 }
+
+
+def obtener_eventos_unicos():
+    """
+    Obtiene todas las fechas únicas necesarias para descarga,
+    a partir de los eventos definidos por volcán.
+    """
+    eventos = set()
+
+    for info in VOLCANES.values():
+        for fecha in info.get("eventos", []):
+            eventos.add(fecha)
+
+    return sorted(eventos)
 
 
 # ==========================================================
@@ -65,13 +102,40 @@ def fecha_a_juliano(fecha):
     return dt.year, dt.timetuple().tm_yday
 
 
-def descargar_goes_eventos(horas_utc=range(0, 24)):
+def extraer_banda(path):
+    nombre = os.path.basename(path)
+    m = re.search(r"C(0[1-9]|1[0-6])", nombre)
+
+    if m:
+        return "C" + m.group(1)
+
+    return None
+
+
+def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
+    """
+    Descarga desde AWS todas las bandas definidas en BANDAS_DESCARGA.
+    Los archivos se guardan como:
+    INPUT_BASE/fecha/hora/banda/*.nc
+    """
+
+    print("\n==============================")
+    print("CONFIGURACIÓN DESCARGA")
+    print("==============================")
+    print("Bucket:", BUCKET_GOES)
+    print("Producto:", PRODUCTO_GOES)
+    print("Eventos únicos:", eventos)
+    print("Bandas descarga:", BANDAS_DESCARGA)
+    print("Horas UTC:", list(horas_utc))
+    print("Input:", INPUT_BASE)
+    print("==============================\n")
+
     s3 = boto3.client(
         "s3",
         config=Config(signature_version=UNSIGNED)
     )
 
-    for fecha in EVENTOS:
+    for fecha in eventos:
         year, jday = fecha_a_juliano(fecha)
 
         for hour in horas_utc:
@@ -98,7 +162,7 @@ def descargar_goes_eventos(horas_utc=range(0, 24)):
                 nombre = os.path.basename(key)
                 banda = extraer_banda(nombre)
 
-                if banda not in BANDAS_REQUERIDAS:
+                if banda not in BANDAS_DESCARGA:
                     continue
 
                 out_dir = os.path.join(
@@ -149,16 +213,6 @@ def normalizar(data, vmin=None, vmax=None):
     return data
 
 
-def extraer_banda(path):
-    nombre = os.path.basename(path)
-    m = re.search(r"C(0[1-9]|1[0-6])", nombre)
-
-    if m:
-        return "C" + m.group(1)
-
-    return None
-
-
 def extraer_timestamp(path):
     nombre = os.path.basename(path)
 
@@ -179,6 +233,11 @@ def extraer_timestamp(path):
 
 
 def buscar_y_agrupar_archivos(input_base):
+    """
+    Busca archivos locales .nc y agrupa escenas completas.
+    Aunque se descarguen todas las bandas, para RGB solo exige BANDAS_RGB.
+    """
+
     archivos = glob.glob(
         os.path.join(input_base, "**", "*.nc"),
         recursive=True
@@ -191,7 +250,7 @@ def buscar_y_agrupar_archivos(input_base):
     for archivo in archivos:
         banda = extraer_banda(archivo)
 
-        if banda not in BANDAS_REQUERIDAS:
+        if banda not in BANDAS_RGB:
             continue
 
         timestamp = extraer_timestamp(archivo)
@@ -203,13 +262,20 @@ def buscar_y_agrupar_archivos(input_base):
 
     grupos_completos = {
         t: bandas for t, bandas in grupos.items()
-        if all(b in bandas for b in BANDAS_REQUERIDAS)
+        if all(b in bandas for b in BANDAS_RGB)
     }
 
     return grupos_completos
 
 
 def recortar_goes_da(da, ds, bbox):
+    """
+    Recorta una banda GOES ABI usando una bbox geográfica:
+    bbox = [lon_min, lat_min, lon_max, lat_max]
+
+    No reproyecta toda la imagen.
+    Solo transforma la bbox lat/lon a coordenadas GOES para recortar.
+    """
     lon_min, lat_min, lon_max, lat_max = bbox
 
     proj_attrs = ds["goes_imager_projection"].attrs
@@ -255,7 +321,10 @@ def leer_banda_recortada(archivo, bbox):
     da = ds["CMI"].astype(float)
     da_crop = recortar_goes_da(da, ds, bbox)
 
-    return da_crop.compute().values
+    valores = da_crop.compute().values
+    ds.close()
+
+    return valores
 
 
 # ==========================================================
@@ -373,23 +442,35 @@ def guardar_rgb(
 # ==========================================================
 
 def main():
+    eventos_unicos = obtener_eventos_unicos()
+
+    # Descarga todas las bandas de las fechas definidas por volcán
     descargar_goes_eventos(
+        eventos=eventos_unicos,
         horas_utc=range(0, 24)
     )
 
+    # Agrupa únicamente las bandas necesarias para RGB
     grupos = buscar_y_agrupar_archivos(INPUT_BASE)
 
     print(f"\nEscenas completas encontradas: {len(grupos)}")
 
     for timestamp, archivos_bandas in sorted(grupos.items()):
 
-        if "-" in timestamp:
-            fecha_timestamp = timestamp.split("_")[0]
+        if "-" not in timestamp:
+            continue
 
-            if fecha_timestamp not in EVENTOS:
-                continue
+        fecha_timestamp = timestamp.split("_")[0]
 
         for nombre_volcan, info in VOLCANES.items():
+
+            eventos_volcan = info.get("eventos", [])
+
+            # CORRECCIÓN CLAVE:
+            # Solo procesa el timestamp si la fecha corresponde al volcán.
+            if fecha_timestamp not in eventos_volcan:
+                continue
+
             print(f"\nProcesando {nombre_volcan} | {timestamp}")
 
             bbox = info["bbox"]
@@ -427,25 +508,36 @@ def main():
                 c15
             )
 
-            out_dir = os.path.join(
-                OUTPUT_BASE,
-                nombre_volcan,
-                timestamp.split("_")[0],
-                timestamp
-            )
-
-            os.makedirs(out_dir, exist_ok=True)
+            # Nueva organización:
+            # OUTPUT_BASE/fecha/volcan/RGB/volcan_fecha_hora_rgb.png
+            fecha_out = fecha_timestamp
 
             for nombre_rgb, rgb in rgbs.items():
+
+                out_dir = os.path.join(
+                    OUTPUT_BASE,
+                    fecha_out,
+                    nombre_volcan,
+                    nombre_rgb
+                )
+
+                os.makedirs(out_dir, exist_ok=True)
+
                 titulo = (
                     f"{nombre_volcan} | "
                     f"{timestamp} UTC | "
                     f"{nombre_rgb}"
                 )
 
+                out_name = (
+                    f"{nombre_volcan}_"
+                    f"{timestamp}_"
+                    f"{nombre_rgb}.png"
+                )
+
                 out_path = os.path.join(
                     out_dir,
-                    f"{nombre_rgb}.png"
+                    out_name
                 )
 
                 guardar_rgb(
