@@ -94,49 +94,96 @@ def obtener_token():
 
 
 def buscar_producto_so2_mas_reciente():
+
     ahora = datetime.now(timezone.utc)
+
     inicio = ahora - timedelta(days=SEARCH_DAYS_BACK)
 
-    inicio_txt = inicio.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    ahora_txt = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    inicio_txt = inicio.strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+
+    ahora_txt = ahora.strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+
+    # =========================================================
+    # REGION CHILE VOLCANES
+    # =========================================================
+
+    lon_min = -76.0
+    lat_min = -42.0
+
+    lon_max = -66.0
+    lat_max = -20.0
+
+    wkt = (
+        f"POLYGON(("
+        f"{lon_min} {lat_min},"
+        f"{lon_max} {lat_min},"
+        f"{lon_max} {lat_max},"
+        f"{lon_min} {lat_max},"
+        f"{lon_min} {lat_min}"
+        f"))"
+    )
 
     filtro = (
         f"Collection/Name eq '{COLLECTION}' "
         f"and contains(Name,'{NAME_CONTAINS}') "
         f"and ContentDate/Start ge {inicio_txt} "
-        f"and ContentDate/Start le {ahora_txt}"
+        f"and ContentDate/Start le {ahora_txt} "
+        f"and OData.CSC.Intersects("
+        f"area=geography'SRID=4326;{wkt}')"
     )
 
     params = (
-        f"?$filter={quote(filtro, safe='()/,$= ')}"
+        f"?$filter={quote(filtro, safe='()/,$=; ')}"
         f"&$orderby=ContentDate/Start desc"
         f"&$top=1"
     )
 
     url = CATALOG_URL + params
 
-    print("\nBuscando producto Sentinel-5P SO2 más reciente:")
+    print(
+        "\nBuscando producto Sentinel-5P "
+        "SO2 sobre Chile:"
+    )
+
     print(url)
 
-    r = requests.get(url, timeout=60)
+    r = requests.get(
+        url,
+        timeout=60
+    )
+
     r.raise_for_status()
 
-    productos = r.json().get("value", [])
+    productos = r.json().get(
+        "value",
+        []
+    )
 
     if not productos:
+
         raise RuntimeError(
-            f"No se encontraron productos SO2 en los últimos {SEARCH_DAYS_BACK} días."
+            "No se encontraron productos "
+            "SO2 sobre Chile."
         )
 
     producto = productos[0]
 
     print("\nProducto encontrado:")
+
     print("Nombre:", producto["Name"])
+
     print("Id:", producto["Id"])
-    print("Fecha:", producto["ContentDate"]["Start"])
+
+    print(
+        "Fecha:",
+        producto["ContentDate"]["Start"]
+    )
 
     return producto
-
 
 def descargar_producto(producto, token):
     RAW_S5P.mkdir(parents=True, exist_ok=True)
