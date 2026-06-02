@@ -26,8 +26,16 @@ OUTPUT_BASE = OUT_RGB_ASH
 # Para eventos históricos de Chile
 BUCKET_GOES = "noaa-goes16"
 
-# Producto ABI Full Disk
-PRODUCTO_GOES = "ABI-L2-CMIPF"
+# Productos ABI Full Disk a descargar
+# L1b: radiancias calibradas
+# L2 CMIP: Cloud and Moisture Imagery, usado después para RGB
+PRODUCTOS_GOES = [
+    "ABI-L1b-RadF",
+    "ABI-L2-CMIPF",
+]
+
+# Producto que se usará para generar los RGB
+PRODUCTO_RGB = "ABI-L2-CMIPF"
 
 # Todas las bandas ABI para descarga
 BANDAS_DESCARGA = [
@@ -118,7 +126,7 @@ def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
     print("CONFIGURACIÓN DESCARGA")
     print("==============================")
     print("Bucket:", BUCKET_GOES)
-    print("Producto:", PRODUCTO_GOES)
+    print("Productos:", PRODUCTOS_GOES)
     print("Eventos únicos:", eventos)
     print("Bandas descarga:", BANDAS_DESCARGA)
     print("Horas UTC:", list(horas_utc))
@@ -134,70 +142,75 @@ def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
 
         year, jday = fecha_a_juliano(fecha)
 
-        for hour in horas_utc:
+        for producto in PRODUCTOS_GOES:
 
-            prefix = f"{PRODUCTO_GOES}/{year}/{jday:03d}/{hour:02d}/"
+            for hour in horas_utc:
 
-            print(f"\nBuscando:")
-            print(f"s3://{BUCKET_GOES}/{prefix}")
+                prefix = f"{producto}/{year}/{jday:03d}/{hour:02d}/"
 
-            try:
-
-                resp = s3.list_objects_v2(
-                    Bucket=BUCKET_GOES,
-                    Prefix=prefix
-                )
-
-            except Exception as e:
-
-                print(f"Error AWS: {e}")
-                continue
-
-            if "Contents" not in resp:
-                print("No hay archivos.")
-                continue
-
-            for obj in resp["Contents"]:
-
-                key = obj["Key"]
-
-                nombre = Path(key).name
-                banda = extraer_banda(nombre)
-
-                if banda not in BANDAS_DESCARGA:
-                    continue
-
-                out_dir = (
-                    INPUT_BASE
-                    / fecha
-                    / banda
-                )
-                
-
-                out_dir.mkdir(
-                    parents=True,
-                    exist_ok=True
-                )
-
-                out_path = out_dir / nombre
-
-                if out_path.exists():
-                    print(f"Ya existe: {nombre}")
-                    continue
-
-                print(f"Descargando: {nombre}")
+                print(f"\nBuscando:")
+                print(f"s3://{BUCKET_GOES}/{prefix}")
 
                 try:
 
-                    s3.download_file(
-                        BUCKET_GOES,
-                        key,
-                        str(out_path)
+                    resp = s3.list_objects_v2(
+                        Bucket=BUCKET_GOES,
+                        Prefix=prefix
                     )
 
                 except Exception as e:
 
-                    print(f"Error descarga: {e}")
+                    print(f"Error AWS: {e}")
+                    continue
+
+                if "Contents" not in resp:
+                    print("No hay archivos.")
+                    continue
+
+                for obj in resp["Contents"]:
+
+                    key = obj["Key"]
+
+                    nombre = Path(key).name
+                    banda = extraer_banda(nombre)
+
+                    if banda not in BANDAS_DESCARGA:
+                        continue
+
+                    # Nueva estructura:
+                    # RAW_GOES / producto / fecha / banda / archivos.nc
+                    # La hora ya viene en el nombre del archivo GOES.
+                    out_dir = (
+                        INPUT_BASE
+                        / producto
+                        / fecha
+                        / banda
+                    )
+
+                    out_dir.mkdir(
+                        parents=True,
+                        exist_ok=True
+                    )
+
+                    out_path = out_dir / nombre
+
+                    if out_path.exists():
+                        print(f"Ya existe: {nombre}")
+                        continue
+
+                    print(f"Descargando: {nombre}")
+
+                    try:
+
+                        s3.download_file(
+                            BUCKET_GOES,
+                            key,
+                            str(out_path)
+                        )
+
+                    except Exception as e:
+
+                        print(f"Error descarga: {e}")
 
 
 # ==========================================================
@@ -501,8 +514,10 @@ def main():
         horas_utc=range(0, 24)
     )
 
+    # Los RGB actuales usan L2 CMIP porque esperan la variable CMI.
+    # L1b se descarga, pero no se procesa aquí.
     grupos = buscar_y_agrupar_archivos(
-        INPUT_BASE
+        INPUT_BASE / PRODUCTO_RGB
     )
 
     print(
