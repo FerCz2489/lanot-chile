@@ -170,9 +170,9 @@ def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
                 out_dir = (
                     INPUT_BASE
                     / fecha
-                    / f"{hour:02d}"
                     / banda
                 )
+                
 
                 out_dir.mkdir(
                     parents=True,
