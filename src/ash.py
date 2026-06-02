@@ -31,6 +31,7 @@ BUCKET_GOES = "noaa-goes16"
 # L2 CMIP: Cloud and Moisture Imagery, usado después para RGB
 PRODUCTOS_GOES = [
     "ABI-L1b-RadF",
+    "ABI-L2-ACTPF",
     "ABI-L2-CMIPF",
 ]
 
