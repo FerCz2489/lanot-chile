@@ -14,3 +14,14 @@ Proyecto para análisis de datos satelitales (Sentinel-5P) enfocado en detecció
 Activar entorno:
 
 source venv/bin/activate
+
+# Construir contenedor
+sudo apptainer build lanot-chile.sif lanot-chile.def
+
+# SO2
+export COPERNICUS_USER="..."
+export COPERNICUS_PASSWORD="..."
+apptainer exec lanot-chile.sif python src/sentinel5p.py
+
+# Ceniza GOES
+apptainer exec lanot-chile.sif python src/ash.py
