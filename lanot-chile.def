@@ -1,0 +1,23 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%files
+    requirements.txt /opt/requirements.txt
+
+%post
+    apt update && apt install -y \
+        g++ \
+        gcc \
+        libproj-dev \
+        proj-data \
+        proj-bin \
+        libnetcdf-dev \
+        libhdf5-dev \
+        git \
+        && apt clean
+
+    pip install --no-cache-dir --upgrade pip
+    pip install --no-cache-dir -r /opt/requirements.txt
+
+%runscript
+    exec python "$@"
