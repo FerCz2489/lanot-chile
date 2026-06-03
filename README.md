@@ -18,7 +18,7 @@ source venv/bin/activate
 # Construir contenedor
 sudo apptainer build lanot-chile.sif lanot-chile.def
 
-# SO2
+# SO2 sentinel-5p
 export COPERNICUS_USER="..."
 export COPERNICUS_PASSWORD="..."
 apptainer exec lanot-chile.sif python src/sentinel5p.py
