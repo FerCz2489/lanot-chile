@@ -73,7 +73,11 @@ Construir la imagen:
 ```bash
 sudo apptainer build lanot-chile.sif lanot-chile.def
 ```
+En caso de tener problemas con el fakepath:
 
+```bash
+apptainer build --fakeroot --no-subuid lanot-chile.sif lanot-chile.def
+```
 Este paso solo se realiza una vez.
 
 ---
