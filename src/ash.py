@@ -1,7 +1,8 @@
 from pathlib import Path
-import os
 import re
+import csv
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import boto3
 from botocore import UNSIGNED
@@ -19,16 +20,12 @@ from config import RAW_GOES, OUT_RGB_ASH
 # CONFIGURACIÓN GENERAL
 # ==========================================================
 
-# Ahora vienen desde config.py
 INPUT_BASE = RAW_GOES
 OUTPUT_BASE = OUT_RGB_ASH
 
-# Para eventos históricos de Chile
 BUCKET_GOES = "noaa-goes16"
 
 # Productos ABI Full Disk a descargar
-# L1b: radiancias calibradas
-# L2 CMIP: Cloud and Moisture Imagery, usado después para RGB
 PRODUCTOS_GOES = [
     "ABI-L1b-RadF",
     "ABI-L2-ACTPF",
@@ -49,54 +46,183 @@ BANDAS_DESCARGA = [
 # Bandas necesarias para RGB volcánicos
 BANDAS_RGB = ["C07", "C11", "C13", "C14", "C15"]
 
+# CSV del proyecto
+BASE_DIR = Path(__file__).resolve().parents[1]
+EVENTOS_DIR = BASE_DIR / "data" / "eventos"
+VOLCANES_CSV = EVENTOS_DIR / "volcanes.csv"
+EVENTOS_CSV = EVENTOS_DIR / "eventos.csv"
+
 
 # ==========================================================
-# VOLCANES Y FECHAS
+# LECTURA CSV
 # ==========================================================
 
-VOLCANES = {
+def leer_volcanes_csv(path=VOLCANES_CSV):
+    """
+    Lee data/eventos/volcanes.csv
 
-    "Chillan": {
-        "lat": -36.868,
-        "lon": -71.378,
-        "bbox": [-73.5, -38.2, -69.8, -35.2],
-        "eventos": [
-            "2019-03-08",
-            "2020-01-30",
-            "2020-04-08",
-        ],
-    },
+    Formato:
+    volcan,lat,lon,lon_min,lat_min,lon_max,lat_max
+    """
 
-    "Lascar": {
-        "lat": -23.370,
-        "lon": -67.730,
-        "bbox": [-70.0, -25.0, -65.5, -21.5],
-        "eventos": [
-            "2022-12-10",
-            "2023-01-27",
-        ],
-    },
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"No existe {path}. Crea data/eventos/volcanes.csv"
+        )
 
-    "Villarrica": {
-        "lat": -39.420,
-        "lon": -71.930,
-        "bbox": [-74.0, -41.0, -70.0, -38.0],
-        "eventos": [
-            # Agregar fechas futuras aquí
-        ],
-    },
-}
+    volcanes = {}
+
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            nombre = row["volcan"].strip()
+
+            volcanes[nombre] = {
+                "lat": float(row["lat"]),
+                "lon": float(row["lon"]),
+                "bbox": [
+                    float(row["lon_min"]),
+                    float(row["lat_min"]),
+                    float(row["lon_max"]),
+                    float(row["lat_max"]),
+                ],
+            }
+
+    return volcanes
 
 
-def obtener_eventos_unicos():
+def leer_eventos_csv(path=EVENTOS_CSV):
+    """
+    Lee data/eventos/eventos.csv
 
-    eventos = set()
+    Formato:
+    volcan,fecha,hora_inicio,hora_fin
 
-    for info in VOLCANES.values():
-        for fecha in info.get("eventos", []):
-            eventos.add(fecha)
+    - fecha en YYYY-MM-DD
+    - hora_inicio y hora_fin opcionales.
+    - si no hay horas, se descarga todo el día.
+    """
 
-    return sorted(eventos)
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"No existe {path}. Crea data/eventos/eventos.csv"
+        )
+
+    eventos = []
+
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            volcan = row["volcan"].strip()
+            fecha = row["fecha"].strip()
+            hora_inicio = (row.get("hora_inicio") or "").strip()
+            hora_fin = (row.get("hora_fin") or "").strip()
+
+            if not volcan or not fecha:
+                continue
+
+            # valida formato de fecha
+            datetime.strptime(fecha, "%Y-%m-%d")
+
+            eventos.append({
+                "volcan": volcan,
+                "fecha": fecha,
+                "hora_inicio": hora_inicio,
+                "hora_fin": hora_fin,
+            })
+
+    return eventos
+
+
+def hora_a_entero(hora_txt):
+    """
+    Convierte '13:46' -> 13, '13' -> 13.
+    """
+
+    if not hora_txt:
+        return None
+
+    hora_txt = hora_txt.strip()
+
+    if ":" in hora_txt:
+        return int(hora_txt.split(":")[0])
+
+    return int(hora_txt)
+
+
+def horas_evento(evento):
+    """
+    Devuelve las horas UTC a descargar para un evento.
+
+    Si no hay hora_inicio/hora_fin: descarga 0-23.
+    Si hay rango: descarga horas enteras inclusivas.
+    Si hora_fin < hora_inicio, asume que cruza medianoche y
+    para esa fecha descarga desde hora_inicio hasta 23.
+    La continuación debe ponerse como otra fila del día siguiente.
+    """
+
+    hi = hora_a_entero(evento.get("hora_inicio", ""))
+    hf = hora_a_entero(evento.get("hora_fin", ""))
+
+    if hi is None and hf is None:
+        return list(range(0, 24))
+
+    if hi is not None and hf is None:
+        hf = hi
+
+    if hi is None and hf is not None:
+        hi = hf
+
+    if hf < hi:
+        return list(range(hi, 24))
+
+    return list(range(hi, hf + 1))
+
+
+def eventos_por_fecha(eventos):
+    """
+    Regresa:
+    {
+      '2023-09-23': {8,9,10,11,12,13},
+      ...
+    }
+    """
+
+    salida = defaultdict(set)
+
+    for ev in eventos:
+        for h in horas_evento(ev):
+            salida[ev["fecha"]].add(h)
+
+    return {
+        fecha: sorted(horas)
+        for fecha, horas in salida.items()
+    }
+
+
+def eventos_por_volcan_fecha(eventos):
+    """
+    Regresa:
+    {
+      ('Villarrica','2023-09-23'): {8,9,10,11,12,13},
+      ...
+    }
+    """
+
+    salida = defaultdict(set)
+
+    for ev in eventos:
+        key = (ev["volcan"], ev["fecha"])
+
+        for h in horas_evento(ev):
+            salida[key].add(h)
+
+    return {
+        key: sorted(horas)
+        for key, horas in salida.items()
+    }
 
 
 # ==========================================================
@@ -121,16 +247,17 @@ def extraer_banda(path):
     return None
 
 
-def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
+def descargar_goes_eventos(eventos):
+
+    fechas_horas = eventos_por_fecha(eventos)
 
     print("\n==============================")
-    print("CONFIGURACIÓN DESCARGA")
+    print("CONFIGURACIÓN DESCARGA GOES")
     print("==============================")
     print("Bucket:", BUCKET_GOES)
     print("Productos:", PRODUCTOS_GOES)
-    print("Eventos únicos:", eventos)
+    print("Fechas:", list(fechas_horas.keys()))
     print("Bandas descarga:", BANDAS_DESCARGA)
-    print("Horas UTC:", list(horas_utc))
     print("Input:", INPUT_BASE)
     print("==============================\n")
 
@@ -139,7 +266,7 @@ def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
         config=Config(signature_version=UNSIGNED)
     )
 
-    for fecha in eventos:
+    for fecha, horas_utc in fechas_horas.items():
 
         year, jday = fecha_a_juliano(fecha)
 
@@ -175,18 +302,31 @@ def descargar_goes_eventos(eventos, horas_utc=range(0, 24)):
                     nombre = Path(key).name
                     banda = extraer_banda(nombre)
 
-                    if banda not in BANDAS_DESCARGA:
-                        continue
+                    # ======================================================
+                    # ACTPF no usa bandas C01-C16
+                    # ======================================================
 
-                    # Nueva estructura:
-                    # RAW_GOES / producto / fecha / banda / archivos.nc
-                    # La hora ya viene en el nombre del archivo GOES.
-                    out_dir = (
-                        INPUT_BASE
-                        / producto
-                        / fecha
-                        / banda
-                    )
+                    if producto == "ABI-L2-ACTPF":
+
+                        out_dir = (
+                            INPUT_BASE
+                            / producto
+                            / fecha
+                        )
+
+                    else:
+
+                        if banda not in BANDAS_DESCARGA:
+                            continue
+
+                        # RAW_GOES / producto / fecha / banda / archivo.nc
+                        # La hora ya viene en el nombre del archivo GOES.
+                        out_dir = (
+                            INPUT_BASE
+                            / producto
+                            / fecha
+                            / banda
+                        )
 
                     out_dir.mkdir(
                         parents=True,
@@ -298,6 +438,17 @@ def buscar_y_agrupar_archivos(input_base):
     }
 
     return grupos_completos
+
+
+def timestamp_a_fecha_hora(timestamp):
+    """
+    '2023-09-23_0841' -> ('2023-09-23', 8)
+    """
+
+    fecha, hhmm = timestamp.split("_")
+    hora = int(hhmm[:2])
+
+    return fecha, hora
 
 
 def recortar_goes_da(da, ds, bbox):
@@ -502,21 +653,10 @@ def guardar_rgb(
     plt.close()
 
 
-# ==========================================================
-# MAIN
-# ==========================================================
+def procesar_rgb(volcanes, eventos):
 
-def main():
+    eventos_vf = eventos_por_volcan_fecha(eventos)
 
-    eventos_unicos = obtener_eventos_unicos()
-
-    descargar_goes_eventos(
-        eventos=eventos_unicos,
-        horas_utc=range(0, 24)
-    )
-
-    # Los RGB actuales usan L2 CMIP porque esperan la variable CMI.
-    # L1b se descarga, pero no se procesa aquí.
     grupos = buscar_y_agrupar_archivos(
         INPUT_BASE / PRODUCTO_RGB
     )
@@ -530,16 +670,16 @@ def main():
         if "-" not in timestamp:
             continue
 
-        fecha_timestamp = timestamp.split("_")[0]
+        fecha_timestamp, hora_timestamp = timestamp_a_fecha_hora(timestamp)
 
-        for nombre_volcan, info in VOLCANES.items():
+        for nombre_volcan, info in volcanes.items():
 
-            eventos_volcan = info.get(
-                "eventos",
-                []
-            )
+            key = (nombre_volcan, fecha_timestamp)
 
-            if fecha_timestamp not in eventos_volcan:
+            if key not in eventos_vf:
+                continue
+
+            if hora_timestamp not in eventos_vf[key]:
                 continue
 
             print(
@@ -621,8 +761,61 @@ def main():
                     nombre_volcan=nombre_volcan
                 )
 
-    print("\nProceso terminado.")
-    print("Outputs en:", OUTPUT_BASE)
+
+# ==========================================================
+# RUN
+# ==========================================================
+
+def run(modo="todo"):
+
+    modo = modo.lower().strip()
+
+    if modo not in {"todo", "descarga", "rgb"}:
+        raise ValueError("modo debe ser: todo, descarga o rgb")
+
+    volcanes = leer_volcanes_csv()
+    eventos = leer_eventos_csv()
+
+    print("\nVolcanes cargados:", len(volcanes))
+    print("Eventos cargados:", len(eventos))
+
+    volcanes_eventos = sorted(set(ev["volcan"] for ev in eventos))
+    faltantes = [v for v in volcanes_eventos if v not in volcanes]
+
+    if faltantes:
+        raise ValueError(
+            "Hay volcanes en eventos.csv que no existen en volcanes.csv: "
+            + ", ".join(faltantes)
+        )
+
+    if modo in {"todo", "descarga"}:
+        descargar_goes_eventos(eventos)
+
+    if modo in {"todo", "rgb"}:
+        procesar_rgb(volcanes, eventos)
+
+    print("\nProceso GOES terminado.")
+    print("RAW_GOES:", INPUT_BASE)
+    print("OUT_RGB_ASH:", OUTPUT_BASE)
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Pipeline GOES para descarga y RGB de ceniza."
+    )
+
+    parser.add_argument(
+        "--modo",
+        choices=["todo", "descarga", "rgb"],
+        default="todo",
+        help="todo=descarga+rgb, descarga=solo descarga, rgb=solo procesa RGB"
+    )
+
+    args = parser.parse_args()
+
+    run(modo=args.modo)
 
 
 if __name__ == "__main__":
