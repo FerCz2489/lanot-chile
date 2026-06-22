@@ -73,11 +73,13 @@ Construir la imagen:
 ```bash
 sudo apptainer build lanot-chile.sif lanot-chile.def
 ```
-En caso de tener problemas con el fakepath:
+
+En caso de tener problemas con fakeroot:
 
 ```bash
 apptainer build --fakeroot --no-subuid lanot-chile.sif lanot-chile.def
 ```
+
 Este paso solo se realiza una vez.
 
 ---
@@ -109,6 +111,7 @@ Formato:
 
 ```csv
 volcan,lat,lon,lon_min,lat_min,lon_max,lat_max
+Villarrica,-39.42,-71.93,-74.0,-41.0,-70.0,-38.0
 ```
 
 ---
@@ -139,7 +142,123 @@ apptainer exec lanot-chile.sif python src/main.py \
     --modo rgb
 ```
 
-Productos descargados:
+---
+
+# Filtros para GOES
+
+Para evitar descargar todos los eventos de una sola vez, se pueden usar filtros.
+
+## Filtrar por volcán
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan
+```
+
+---
+
+## Filtrar por año
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --year 2020
+```
+
+---
+
+## Filtrar por fecha específica
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --fecha 2020-04-08
+```
+
+---
+
+## Solo eventos con hora definida
+
+Esto evita descargar días completos.
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --year 2020 \
+    --solo-con-hora
+```
+
+---
+
+## Solo eventos sin hora definida
+
+Descarga el día completo (00–23 UTC).
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --year 2020 \
+    --solo-sin-hora
+```
+
+---
+
+## Limitar número de eventos
+
+Procesa solo las primeras N filas después de aplicar filtros.
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --year 2020 \
+    --max-eventos 3
+```
+
+---
+
+## Prueba pequeña recomendada
+
+Ejemplo con un solo evento:
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo descarga \
+    --volcan Chillan \
+    --fecha 2020-04-08 \
+    --solo-con-hora \
+    --max-eventos 1
+```
+
+Después generar RGB:
+
+```bash
+apptainer exec lanot-chile.sif python src/main.py \
+    --producto goes \
+    --modo rgb \
+    --volcan Chillan \
+    --fecha 2020-04-08 \
+    --solo-con-hora \
+    --max-eventos 1
+```
+
+---
+
+# Productos descargados
+
+GOES:
 
 * ABI-L1b-RadF
 * ABI-L2-CMIPF
@@ -150,7 +269,7 @@ RGB generados:
 * NOAA/NASA Ash RGB
 * HOTVOLC
 * CNN Ash RGB
-* Pavolonis Microphysics RGB
+* MICROPHYSICS_PAVOLONIS
 
 ---
 
@@ -196,7 +315,5 @@ data/outputs/so2/
 * Los productos generados no se almacenan en GitHub.
 * El archivo `.sif` no se almacena en GitHub.
 * Los eventos volcánicos pueden añadirse modificando únicamente los archivos CSV.
-* No es necesario modificar el código para agregar nuevos volcanes o nuevas fechas.
-
-```
-```
+* No es necesario modificar el código para agregar nuevos volcanes o nuevas fechas; basta con actualizar `volcanes.csv` y `eventos.csv`.
+* Para pruebas se recomienda usar `--volcan`, `--year`, `--fecha`, `--solo-con-hora` y `--max-eventos`.
