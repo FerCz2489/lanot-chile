@@ -23,7 +23,7 @@ from config import RAW_GOES, OUT_RGB_ASH
 INPUT_BASE = RAW_GOES
 OUTPUT_BASE = OUT_RGB_ASH
 
-BUCKET_GOES = "noaa-goes16"
+# Bucket GOES se decide automaticamente por fecha del evento
 
 # Productos ABI Full Disk a descargar
 PRODUCTOS_GOES = [
@@ -320,6 +320,23 @@ def fecha_a_juliano(fecha):
     return dt.year, dt.timetuple().tm_yday
 
 
+def obtener_bucket_goes(fecha):
+    """
+    Decide automaticamente que bucket usar segun la fecha del evento.
+
+    Para eventos historicos se usa GOES-16.
+    Para fechas posteriores al relevo operacional de GOES-East se usa GOES-19.
+    """
+
+    fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
+    cambio_goes19 = datetime(2025, 4, 7)
+
+    if fecha_dt < cambio_goes19:
+        return "noaa-goes16"
+
+    return "noaa-goes19"
+
+
 def extraer_banda(path):
 
     nombre = Path(path).name
@@ -339,7 +356,7 @@ def descargar_goes_eventos(eventos):
     print("\n==============================")
     print("CONFIGURACIÓN DESCARGA GOES")
     print("==============================")
-    print("Bucket:", BUCKET_GOES)
+    print("Bucket: automatico por fecha")
     print("Productos:", PRODUCTOS_GOES)
     print("Fechas:", list(fechas_horas.keys()))
     print("Bandas descarga:", BANDAS_DESCARGA)
@@ -354,6 +371,9 @@ def descargar_goes_eventos(eventos):
     for fecha, horas_utc in fechas_horas.items():
 
         year, jday = fecha_a_juliano(fecha)
+        bucket_goes = obtener_bucket_goes(fecha)
+
+        print(f"\nFecha: {fecha} -> {bucket_goes}")
 
         for producto in PRODUCTOS_GOES:
 
@@ -362,12 +382,12 @@ def descargar_goes_eventos(eventos):
                 prefix = f"{producto}/{year}/{jday:03d}/{hour:02d}/"
 
                 print(f"\nBuscando:")
-                print(f"s3://{BUCKET_GOES}/{prefix}")
+                print(f"s3://{bucket_goes}/{prefix}")
 
                 try:
 
                     resp = s3.list_objects_v2(
-                        Bucket=BUCKET_GOES,
+                        Bucket=bucket_goes,
                         Prefix=prefix
                     )
 
@@ -429,7 +449,7 @@ def descargar_goes_eventos(eventos):
                     try:
 
                         s3.download_file(
-                            BUCKET_GOES,
+                            bucket_goes,
                             key,
                             str(out_path)
                         )
