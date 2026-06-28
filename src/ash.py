@@ -832,8 +832,8 @@ def procesar_rgb(volcanes, eventos):
 
                 out_dir = (
                     OUTPUT_BASE
-                    / fecha_out
                     / nombre_volcan
+                    / fecha_out
                     / nombre_rgb
                 )
 
