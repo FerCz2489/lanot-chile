@@ -2,17 +2,24 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import os
+import subprocess
 
 import requests
 import numpy as np
 import xarray as xr
 import matplotlib.pyplot as plt
+import geopandas as gpd
+import rasterio
+from rasterio.transform import from_origin
+
+from scipy.interpolate import griddata
 
 from config import RAW_S5P, OUT_SO2
 
 
 # ============================================================
-# CONFIGURACION GENERAL
+# SENTINEL-5P SO2:
+# Copernicus L2 -> HARP bin_spatial -> grilla regular -> PNG
 # ============================================================
 
 COPERNICUS_USER = os.getenv("COPERNICUS_USER")
@@ -26,48 +33,100 @@ TOKEN_URL = (
 )
 
 COLLECTION = "SENTINEL-5P"
-
-# Sentinel-5P SO2 NRT suele venir en nombres tipo:
-# S5P_NRTI_L2__SO2____YYYYMMDDT...
 NAME_CONTAINS = "S5P_NRTI_L2__SO2"
 
-# Buscar en los últimos N días
+SRC_DIR = Path(__file__).resolve().parent
+SHAPE_ESTUDIO = SRC_DIR / "campo villarrica.shp"
+
+VILLARRICA_LAT = -39.420
+VILLARRICA_LON = -71.930
+
+# Shape completo + alrededores
+MARGEN_FRACCION = 0.08
+
+# Resolucion HARP en grados (~0.05 = ~5 km)
+RESOLUCION_GRADOS = 0.05
+
+# QA HARP: qa_value 0..1 pasa a validity 0..100
+QA_MIN_HARP = 50
+
+# HARP SO2_type:
+# 0=no_detection, 1=so2_detected, 2=volcanic_detection,
+# 3=detection_near_anthropogenic_source, 4=detection_at_high_sza
+# El tipo 4 puede contener falsos positivos por SZA alto.
+EXCLUIR_SO2_TYPE_4 = True
+
+# Para --latest
 SEARCH_DAYS_BACK = 7
 
-# Política de limpieza local
-KEEP_DAYS = 7
+# Para fecha/hora especifica
+SEARCH_HOURS_AROUND = 3
 
-# QA recomendado
-QA_MIN = 0.5
+# Visual
+PERCENTIL_VMAX = 99.5
 
-# Visualización
-USAR_ESCALA_FIJA = True
-VMIN_FIJO = 0.0
-VMAX_FIJO = 1.0e-2
-PERCENTIL_VMAX = 99.0
+# Si quedan celdas sin observacion tras bin_spatial,
+# rellenarlas visualmente para evitar blanco.
+RELLENAR_HUECOS_VISUALES = True
 
 
 # ============================================================
-# VOLCANES
+# SHAPE Y REGION
 # ============================================================
 
-VOLCANES = {
-    "Chillan": {
-        "lat": -36.868,
-        "lon": -71.378,
-        "bbox": [-73.5, -38.2, -69.8, -35.2],
-    },
-    "Lascar": {
-        "lat": -23.370,
-        "lon": -67.730,
-        "bbox": [-70.0, -25.0, -65.5, -21.5],
-    },
-    "Villarrica": {
-        "lat": -39.420,
-        "lon": -71.930,
-        "bbox": [-74.0, -41.0, -70.0, -38.0],
-    },
-}
+def cargar_zona_estudio():
+    if not SHAPE_ESTUDIO.exists():
+        raise FileNotFoundError(f"No existe: {SHAPE_ESTUDIO}")
+
+    gdf = gpd.read_file(SHAPE_ESTUDIO)
+
+    if gdf.empty:
+        raise RuntimeError("El shapefile esta vacio.")
+
+    if gdf.crs is None:
+        print("ADVERTENCIA: shape sin CRS; se asume EPSG:4326.")
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    try:
+        geom = gdf.geometry.union_all()
+    except AttributeError:
+        geom = gdf.geometry.unary_union
+
+    minx, miny, maxx, maxy = geom.bounds
+
+    mx = (maxx - minx) * MARGEN_FRACCION
+    my = (maxy - miny) * MARGEN_FRACCION
+
+    bounds_mapa = (
+        max(-180.0, minx - mx),
+        max(-90.0, miny - my),
+        min(180.0, maxx + mx),
+        min(90.0, maxy + my),
+    )
+
+    print("\n====================================")
+    print("ZONA DE ESTUDIO")
+    print("====================================")
+    print("Shape:", SHAPE_ESTUDIO)
+    print("Bounds shape:", geom.bounds)
+    print("Bounds mapa:", bounds_mapa)
+
+    return geom, bounds_mapa
+
+
+def bbox_wkt(bounds):
+    minx, miny, maxx, maxy = bounds
+    return (
+        f"POLYGON(("
+        f"{minx} {miny},"
+        f"{maxx} {miny},"
+        f"{maxx} {maxy},"
+        f"{minx} {maxy},"
+        f"{minx} {miny}"
+        f"))"
+    )
 
 
 # ============================================================
@@ -77,411 +136,715 @@ VOLCANES = {
 def obtener_token():
     if not COPERNICUS_USER or not COPERNICUS_PASSWORD:
         raise RuntimeError(
-            "Faltan credenciales. Define COPERNICUS_USER y COPERNICUS_PASSWORD."
+            "Faltan COPERNICUS_USER y COPERNICUS_PASSWORD."
         )
 
-    data = {
-        "client_id": "cdse-public",
-        "username": COPERNICUS_USER,
-        "password": COPERNICUS_PASSWORD,
-        "grant_type": "password",
-    }
-
-    r = requests.post(TOKEN_URL, data=data, timeout=60)
+    r = requests.post(
+        TOKEN_URL,
+        data={
+            "client_id": "cdse-public",
+            "username": COPERNICUS_USER,
+            "password": COPERNICUS_PASSWORD,
+            "grant_type": "password",
+        },
+        timeout=60,
+    )
     r.raise_for_status()
-
     return r.json()["access_token"]
 
 
-def buscar_producto_so2_mas_reciente():
-
-    ahora = datetime.now(timezone.utc)
-
-    inicio = ahora - timedelta(days=SEARCH_DAYS_BACK)
-
-    inicio_txt = inicio.strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z"
-    )
-
-    ahora_txt = ahora.strftime(
-        "%Y-%m-%dT%H:%M:%S.000Z"
-    )
-
-    # =========================================================
-    # REGION CHILE VOLCANES
-    # =========================================================
-
-    lon_min = -76.0
-    lat_min = -42.0
-
-    lon_max = -66.0
-    lat_max = -20.0
-
-    wkt = (
-        f"POLYGON(("
-        f"{lon_min} {lat_min},"
-        f"{lon_max} {lat_min},"
-        f"{lon_max} {lat_max},"
-        f"{lon_min} {lat_max},"
-        f"{lon_min} {lat_min}"
-        f"))"
-    )
+def buscar_productos(inicio, fin, bounds, top=100):
+    ini = inicio.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    end = fin.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    wkt = bbox_wkt(bounds)
 
     filtro = (
         f"Collection/Name eq '{COLLECTION}' "
         f"and contains(Name,'{NAME_CONTAINS}') "
-        f"and ContentDate/Start ge {inicio_txt} "
-        f"and ContentDate/Start le {ahora_txt} "
+        f"and ContentDate/Start ge {ini} "
+        f"and ContentDate/Start le {end} "
         f"and OData.CSC.Intersects("
         f"area=geography'SRID=4326;{wkt}')"
     )
 
-    params = (
-        f"?$filter={quote(filtro, safe='()/,$=; ')}"
-        f"&$orderby=ContentDate/Start desc"
-        f"&$top=1"
+    url = (
+        CATALOG_URL
+        + f"?$filter={quote(filtro, safe='()/,$=; ')}"
+        + "&$orderby=ContentDate/Start desc"
+        + f"&$top={top}"
     )
 
-    url = CATALOG_URL + params
-
-    print(
-        "\nBuscando producto Sentinel-5P "
-        "SO2 sobre Chile:"
-    )
-
-    print(url)
-
-    r = requests.get(
-        url,
-        timeout=60
-    )
-
+    r = requests.get(url, timeout=90)
     r.raise_for_status()
+    return r.json().get("value", [])
 
-    productos = r.json().get(
-        "value",
-        []
+
+def fecha_producto(producto):
+    return datetime.fromisoformat(
+        producto["ContentDate"]["Start"].replace("Z", "+00:00")
+    )
+
+
+def seleccionar_productos(fecha, hora, bounds):
+    """
+    Sin fecha:
+      toma todos los swaths de la fecha del producto mas reciente
+      que intersecta la region.
+
+    Con fecha:
+      si hora=None, toma todos los swaths de ese dia.
+      si hora se indica, toma el swath temporalmente mas cercano.
+    """
+    if fecha is None:
+        ahora = datetime.now(timezone.utc)
+        inicio = ahora - timedelta(days=SEARCH_DAYS_BACK)
+
+        encontrados = buscar_productos(
+            inicio, ahora, bounds, top=100
+        )
+
+        if not encontrados:
+            raise RuntimeError("No encontre L2 SO2 reciente.")
+
+        dia = fecha_producto(encontrados[0]).date()
+
+        inicio_dia = datetime.combine(
+            dia, datetime.min.time(), tzinfo=timezone.utc
+        )
+        fin_dia = inicio_dia + timedelta(days=1)
+
+        productos = buscar_productos(
+            inicio_dia, fin_dia, bounds, top=100
+        )
+
+        print("\nFecha L2 mas reciente:", dia)
+        print("Swaths encontrados:", len(productos))
+        return productos
+
+    dia = datetime.strptime(fecha, "%Y-%m-%d").date()
+
+    if hora is None:
+        inicio = datetime.combine(
+            dia, datetime.min.time(), tzinfo=timezone.utc
+        )
+        fin = inicio + timedelta(days=1)
+
+        productos = buscar_productos(
+            inicio, fin, bounds, top=100
+        )
+
+        if not productos:
+            raise RuntimeError(f"No hay L2 SO2 para {fecha}.")
+
+        print("\nFecha solicitada:", fecha)
+        print("Swaths encontrados:", len(productos))
+        return productos
+
+    objetivo = datetime.strptime(
+        f"{fecha} {hora:02d}:00:00",
+        "%Y-%m-%d %H:%M:%S",
+    ).replace(tzinfo=timezone.utc)
+
+    productos = buscar_productos(
+        objetivo - timedelta(hours=SEARCH_HOURS_AROUND),
+        objetivo + timedelta(hours=SEARCH_HOURS_AROUND),
+        bounds,
+        top=100,
     )
 
     if not productos:
-
         raise RuntimeError(
-            "No se encontraron productos "
-            "SO2 sobre Chile."
+            f"No hay L2 SO2 cerca de {fecha} {hora:02d}:00 UTC."
         )
 
-    producto = productos[0]
-
-    print("\nProducto encontrado:")
-
-    print("Nombre:", producto["Name"])
-
-    print("Id:", producto["Id"])
-
-    print(
-        "Fecha:",
-        producto["ContentDate"]["Start"]
+    elegido = min(
+        productos,
+        key=lambda p: abs(
+            (fecha_producto(p) - objetivo).total_seconds()
+        ),
     )
 
-    return producto
+    print("\nProducto mas cercano:", elegido["Name"])
+    print("Fecha:", elegido["ContentDate"]["Start"])
+
+    return [elegido]
+
 
 def descargar_producto(producto, token):
     RAW_S5P.mkdir(parents=True, exist_ok=True)
 
-    product_id = producto["Id"]
     nombre = producto["Name"]
-
     if not nombre.endswith(".nc"):
-        nombre = nombre + ".nc"
+        nombre += ".nc"
 
-    out_path = RAW_S5P / nombre
+    salida = RAW_S5P / nombre
 
-    if out_path.exists() and out_path.stat().st_size > 0:
-        print("\nEl producto ya existe localmente:")
-        print(out_path)
-        return out_path
+    if salida.exists() and salida.stat().st_size > 0:
+        print("Ya existe:", salida.name)
+        return salida
 
-    url = f"{DOWNLOAD_URL}({product_id})/$value"
+    url = f"{DOWNLOAD_URL}({producto['Id']})/$value"
+    tmp = salida.with_suffix(".nc.part")
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+    print("Descargando:", salida.name)
 
-    tmp_path = out_path.with_suffix(out_path.suffix + ".part")
+    with requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        stream=True,
+        timeout=300,
+    ) as r:
+        r.raise_for_status()
 
-    print("\nDescargando producto:")
-    print(url)
-    print("Salida:", out_path)
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if chunk:
+                    f.write(chunk)
 
-    with requests.Session() as session:
-        session.headers.update(headers)
-
-        with session.get(url, stream=True, timeout=300) as r:
-            r.raise_for_status()
-
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-    tmp_path.rename(out_path)
-
-    print("\nDescarga completa:")
-    print(out_path)
-
-    return out_path
-
-
-def limpiar_nc_viejos():
-    limite = datetime.now().timestamp() - KEEP_DAYS * 24 * 3600
-
-    borrados = 0
-
-    for archivo in RAW_S5P.glob("*.nc"):
-        if archivo.stat().st_mtime < limite:
-            print("Borrando NC viejo:", archivo)
-            archivo.unlink()
-            borrados += 1
-
-    print(f"\nLimpieza RAW_S5P terminada. Archivos borrados: {borrados}")
+    tmp.replace(salida)
+    return salida
 
 
 # ============================================================
-# LECTURA SENTINEL-5P
+# HARP: L2 -> GRILLA
 # ============================================================
 
-def abrir_grupo_product(ruta_nc: Path):
-    return xr.open_dataset(ruta_nc, group="PRODUCT")
+def construir_edges(vmin, vmax, paso):
+    inicio = np.floor(vmin / paso) * paso
+    fin = np.ceil(vmax / paso) * paso
 
-
-def obtener_variables_principales(ds: xr.Dataset):
-    lat = ds["latitude"].isel(time=0)
-    lon = ds["longitude"].isel(time=0)
-    qa = ds["qa_value"].isel(time=0)
-    so2 = ds["sulfurdioxide_total_vertical_column"].isel(time=0)
-
-    return lat, lon, qa, so2
-
-
-def aplicar_filtro_calidad(so2, qa, qa_min=0.5):
-    mascara_qa = qa >= qa_min
-    so2_filtrado = xr.where(mascara_qa, so2, np.nan)
-    return so2_filtrado, mascara_qa
-
-
-def recortar_region(lat, lon, data, bbox):
-    lon_min, lat_min, lon_max, lat_max = bbox
-
-    mascara_roi = (
-        (lat >= lat_min)
-        & (lat <= lat_max)
-        & (lon >= lon_min)
-        & (lon <= lon_max)
+    edges = np.arange(
+        inicio,
+        fin + paso * 0.5,
+        paso,
+        dtype=float,
     )
 
-    data_roi = xr.where(mascara_roi, data, np.nan)
-
-    return data_roi, mascara_roi
+    return edges
 
 
-def preparar_datos_grafica(lat, lon, so2_roi):
-    lon_1d = lon.values.flatten()
-    lat_1d = lat.values.flatten()
-    so2_1d = so2_roi.values.flatten()
-
-    mask = np.isfinite(so2_1d)
-
-    return lon_1d[mask], lat_1d[mask], so2_1d[mask]
+def lista_harp(valores):
+    return "(" + ",".join(f"{v:.6f}" for v in valores) + ")"
 
 
-def definir_escala_color(so2_1d):
-    if USAR_ESCALA_FIJA:
-        return VMIN_FIJO, VMAX_FIJO
+def convertir_con_harp(archivos_l2, bounds, fecha_tag):
+    """
+    1) Convierte cada L2 a HARP y filtra QA/region.
+    2) Combina los productos.
+    3) bin_spatial usando latitude_bounds/longitude_bounds.
+    """
+    minx, miny, maxx, maxy = bounds
 
-    vmax = np.nanpercentile(so2_1d, PERCENTIL_VMAX)
-
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = np.nanmax(so2_1d)
-
-    return 0.0, vmax
-
-
-def fecha_desde_nombre_s5p(archivo_nc: Path):
-    nombre = archivo_nc.name
-
-    # Ejemplo:
-    # S5P_NRTI_L2__SO2____20260326T192229_...
-    partes = nombre.split("____")
-
-    if len(partes) > 1:
-        fecha = partes[1][:8]
-        try:
-            return datetime.strptime(fecha, "%Y%m%d").strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
-
-# ============================================================
-# GRAFICA
-# ============================================================
-
-def graficar_so2(
-    lat,
-    lon,
-    so2_roi,
-    bbox,
-    nombre_volcan,
-    lat_volcan,
-    lon_volcan,
-    archivo_nc,
-):
-    lon_1d, lat_1d, so2_1d = preparar_datos_grafica(lat, lon, so2_roi)
-
-    if so2_1d.size == 0:
-        print(f"No hay datos válidos para graficar en {nombre_volcan}.")
-        return
-
-    vmin, vmax = definir_escala_color(so2_1d)
-
-    lon_min, lat_min, lon_max, lat_max = bbox
-    fecha = fecha_desde_nombre_s5p(archivo_nc)
-
-    out_dir = OUT_SO2 / fecha / nombre_volcan
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_name = f"{nombre_volcan}_{archivo_nc.stem}_SO2.png"
-    out_path = out_dir / out_name
-
-    plt.figure(figsize=(10, 8))
-
-    sc = plt.scatter(
-        lon_1d,
-        lat_1d,
-        c=so2_1d,
-        s=30,
-        marker="s",
-        cmap="jet",
-        vmin=vmin,
-        vmax=vmax,
-        linewidths=0,
+    lat_edges = construir_edges(
+        miny, maxy, RESOLUCION_GRADOS
+    )
+    lon_edges = construir_edges(
+        minx, maxx, RESOLUCION_GRADOS
     )
 
-    cbar = plt.colorbar(sc)
-    cbar.set_label("SO2 total vertical column (mol m$^{-2}$)")
+    harp_dir = RAW_S5P / "harp"
+    harp_dir.mkdir(parents=True, exist_ok=True)
 
-    plt.scatter(
-        lon_volcan,
-        lat_volcan,
-        marker="^",
-        s=140,
-        color="deepskyblue",
-        edgecolor="black",
-        label=nombre_volcan,
-        zorder=5,
+    temporales = []
+
+    # Filtramos por centros de pixel un poco mas amplio que el mapa.
+    # Filtro fundamentado en el PUM + ingestion HARP:
+    # - QA >= 0.5  -> validity >= 50
+    # - excluir SO2_type == 4 (deteccion a SZA alto / potencial falso positivo)
+    filtro_tipo = "SO2_type!=4;" if EXCLUIR_SO2_TYPE_4 else ""
+
+    operaciones_pre = (
+        f"SO2_column_number_density_validity>={QA_MIN_HARP};"
+        f"{filtro_tipo}"
+        f"latitude>={lat_edges[0]};"
+        f"latitude<={lat_edges[-1]};"
+        f"longitude>={lon_edges[0]};"
+        f"longitude<={lon_edges[-1]};"
+        "keep(datetime_start,latitude,longitude,"
+        "latitude_bounds,longitude_bounds,"
+        "SO2_column_number_density,"
+        "SO2_column_number_density_validity)"
     )
 
-    plt.xlim(lon_min, lon_max)
-    plt.ylim(lat_min, lat_max)
+    for i, archivo in enumerate(archivos_l2, start=1):
+        tmp = harp_dir / f"tmp_{fecha_tag}_{i:02d}.nc"
 
-    plt.xlabel("Longitud")
-    plt.ylabel("Latitud")
-    plt.title(f"Sentinel-5P SO2 | {nombre_volcan} | {fecha}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
+        cmd = [
+            "harpconvert",
+            "-a", operaciones_pre,
+            str(archivo),
+            str(tmp),
+        ]
 
-    print("\nPNG generado:")
-    print(out_path)
+        print(f"HARP ingest {i}/{len(archivos_l2)}...")
 
-
-# ============================================================
-# PROCESAMIENTO
-# ============================================================
-
-def procesar_archivo_s5p(archivo_nc: Path):
-    print("\nProcesando archivo:")
-    print(archivo_nc)
-
-    ds = abrir_grupo_product(archivo_nc)
-
-    try:
-        lat, lon, qa, so2 = obtener_variables_principales(ds)
-
-        print("\n========== RESUMEN ==========")
-        print(f"Dimensiones: {dict(ds.dims)}")
-        print(f"latitude shape : {lat.shape}")
-        print(f"longitude shape: {lon.shape}")
-        print(f"qa_value shape : {qa.shape}")
-        print(f"so2 shape      : {so2.shape}")
-
-        so2_filtrado, _ = aplicar_filtro_calidad(
-            so2,
-            qa,
-            qa_min=QA_MIN
+        # Algunos swaths intersectan el bbox del catalogo, pero despues
+        # del filtro QA + recorte HARP pueden quedar completamente vacios.
+        # Eso NO debe detener el mosaico: simplemente se omiten.
+        resultado = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
         )
 
-        for nombre_volcan, info in VOLCANES.items():
-            print(f"\nProcesando volcán: {nombre_volcan}")
+        if resultado.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            mensaje = (resultado.stderr or resultado.stdout or "").strip()
 
-            bbox = info["bbox"]
+            if "product is empty" in mensaje.lower():
+                print(f"  -> VACIO despues de QA/recorte. Se omite.")
+            else:
+                print(f"  -> HARP no pudo usar este swath. Se omite.")
+                if mensaje:
+                    print("     ", mensaje.splitlines()[-1])
 
-            so2_roi, _ = recortar_region(
-                lat,
-                lon,
-                so2_filtrado,
-                bbox=bbox
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+            continue
+
+        print("  -> OK")
+        temporales.append(tmp)
+
+    if not temporales:
+        raise RuntimeError("Todos los swaths quedaron vacios despues del filtro QA/recorte HARP.")
+
+    combinado = harp_dir / f"SO2_{fecha_tag}_L2_COMBINADO.nc"
+
+    if len(temporales) == 1:
+        # harpconvert para asegurar un archivo separado.
+        subprocess.run(
+            [
+                "harpconvert",
+                str(temporales[0]),
+                str(combinado),
+            ],
+            check=True,
+        )
+    else:
+        # harpmerge concatena los productos en la dimension temporal.
+        subprocess.run(
+            [
+                "harpmerge",
+                *[str(p) for p in temporales],
+                str(combinado),
+            ],
+            check=True,
+        )
+
+    salida_l3 = harp_dir / f"SO2_{fecha_tag}_HARP_L3.nc"
+
+    # bin_spatial ya genera el producto espacial gridded.
+    # NO aplicar keep(latitude,longitude,...) despues: en esta etapa
+    # HARP puede representar la grilla mediante dimensiones/variables
+    # espaciales distintas y ese keep provoca:
+    # "cannot keep non-existent variable latitude".
+    operaciones_bin = (
+        f"bin_spatial("
+        f"{lista_harp(lat_edges)},"
+        f"{lista_harp(lon_edges)}"
+        f")"
+    )
+
+    print("\nFiltros HARP aplicados:")
+    print(f"  validity >= {QA_MIN_HARP}")
+    print(f"  excluir SO2_type == 4: {EXCLUIR_SO2_TYPE_4}")
+    print("\nHARP bin_spatial...")
+    subprocess.run(
+        [
+            "harpconvert",
+            "-a", operaciones_bin,
+            str(combinado),
+            str(salida_l3),
+        ],
+        check=True,
+    )
+
+    # Limpieza de temporales.
+    for p in temporales:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+    try:
+        combinado.unlink()
+    except OSError:
+        pass
+
+    print("L3 HARP:", salida_l3)
+    return salida_l3
+
+
+# ============================================================
+# LEER L3 HARP
+# ============================================================
+
+def leer_harp_l3(ruta):
+    ds = xr.open_dataset(ruta)
+
+    try:
+        # HARP bin_spatial puede no guardar latitude/longitude como
+        # variables; en ese caso guarda solamente los bordes de cada celda.
+        if "latitude" in ds.variables:
+            lat = np.asarray(ds["latitude"].values).squeeze()
+        elif "latitude_bounds" in ds.variables:
+            lat_bounds = np.asarray(ds["latitude_bounds"].values, dtype=float)
+            lat = np.nanmean(lat_bounds, axis=1)
+        else:
+            raise RuntimeError(
+                "El L3 HARP no contiene latitude ni latitude_bounds."
             )
 
-            n_roi = int(np.isfinite(so2_roi.values).sum())
-
-            print(f"Pixeles válidos dentro de ROI: {n_roi}")
-
-            if n_roi == 0:
-                print(f"No quedaron pixeles válidos para {nombre_volcan}.")
-                continue
-
-            print(
-                "SO2 ROI min/max:",
-                f"{float(np.nanmin(so2_roi.values)):.6e}",
-                "/",
-                f"{float(np.nanmax(so2_roi.values)):.6e}",
+        if "longitude" in ds.variables:
+            lon = np.asarray(ds["longitude"].values).squeeze()
+        elif "longitude_bounds" in ds.variables:
+            lon_bounds = np.asarray(ds["longitude_bounds"].values, dtype=float)
+            lon = np.nanmean(lon_bounds, axis=1)
+        else:
+            raise RuntimeError(
+                "El L3 HARP no contiene longitude ni longitude_bounds."
             )
 
-            graficar_so2(
-                lat=lat,
-                lon=lon,
-                so2_roi=so2_roi,
-                bbox=bbox,
-                nombre_volcan=nombre_volcan,
-                lat_volcan=info["lat"],
-                lon_volcan=info["lon"],
-                archivo_nc=archivo_nc,
+        da = ds["SO2_column_number_density"]
+
+        # Salida observada de HARP:
+        # (time=1, latitude, longitude)
+        if "time" in da.dims:
+            da = da.isel(time=0)
+
+        da = da.squeeze(drop=True)
+        z = np.asarray(da.values, dtype=float)
+
+        if z.shape == (lon.size, lat.size):
+            z = z.T
+
+        if z.shape != (lat.size, lon.size):
+            raise RuntimeError(
+                f"Shape inesperado HARP: z={z.shape}, "
+                f"lat={lat.size}, lon={lon.size}"
             )
+
+        units = da.attrs.get("units", "mol/m^2")
+
+        print("\n========== L3 HARP LEIDO ==========")
+        print("SO2:", z.shape)
+        print("Lat:", lat.size, float(np.nanmin(lat)), "a", float(np.nanmax(lat)))
+        print("Lon:", lon.size, float(np.nanmin(lon)), "a", float(np.nanmax(lon)))
+        print("Valores SO2 validos:", int(np.isfinite(z).sum()), "/", int(z.size))
+        print("Unidades:", units)
 
     finally:
         ds.close()
+
+    return lon, lat, z, units
+
+
+# ============================================================
+# RELLENO VISUAL
+# ============================================================
+
+def rellenar_huecos(lon, lat, z):
+    """
+    Rellena SOLO huecos pequenos/locales del L3 HARP.
+
+    No interpola entre orbitas separadas ni inventa valores a grandes
+    distancias. Esto evita triangulos/rayas artificiales.
+    """
+    if not RELLENAR_HUECOS_VISUALES:
+        return z
+
+    from scipy.ndimage import distance_transform_edt
+
+    z = np.asarray(z, dtype=float)
+    valid = np.isfinite(z)
+
+    print(
+        "Celdas HARP validas:",
+        int(valid.sum()),
+        "/",
+        int(z.size),
+    )
+
+    if valid.sum() == 0 or valid.all():
+        return z
+
+    # Distancia, en numero de celdas, al dato valido mas cercano.
+    dist, indices = distance_transform_edt(
+        ~valid,
+        return_distances=True,
+        return_indices=True,
+    )
+
+    # Solo rellenamos huecos muy pequenos: maximo 2 celdas (~0.1 grados
+    # con la resolucion actual de 0.05 grados).
+    MAX_DIST_CELDAS = 2.0
+    rellenables = (~valid) & (dist <= MAX_DIST_CELDAS)
+
+    salida = z.copy()
+    nearest = z[tuple(indices)]
+    salida[rellenables] = nearest[rellenables]
+
+    print("Huecos locales rellenados:", int(rellenables.sum()))
+    print("Huecos grandes conservados sin inventar:", int((~np.isfinite(salida)).sum()))
+
+    return salida
+
+
+# ============================================================
+# GEOTIFF
+# ============================================================
+
+def guardar_geotiff(lon, lat, z, fecha_tag):
+    """Guarda la malla HARP como GeoTIFF EPSG:4326."""
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    z = np.asarray(z, dtype=float)
+
+    dx = abs(float(np.nanmedian(np.diff(lon))))
+    dy = abs(float(np.nanmedian(np.diff(lat))))
+
+    if lat[0] < lat[-1]:
+        z_tif = np.flipud(z)
+        north = float(lat[-1] + dy / 2.0)
+    else:
+        z_tif = z.copy()
+        north = float(lat[0] + dy / 2.0)
+
+    west = float(np.nanmin(lon) - dx / 2.0)
+    transform = from_origin(west, north, dx, dy)
+
+    out_dir = OUT_SO2 / fecha_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    salida_tif = out_dir / f"SO2_HARP_L3_ESCALA_FIJA_{fecha_tag}.tif"
+
+    nodata = -9999.0
+    data_out = np.where(np.isfinite(z_tif), z_tif, nodata).astype("float32")
+
+    with rasterio.open(
+        salida_tif,
+        "w",
+        driver="GTiff",
+        height=data_out.shape[0],
+        width=data_out.shape[1],
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=transform,
+        nodata=nodata,
+        compress="deflate",
+        predictor=3,
+        tiled=True,
+    ) as dst:
+        dst.write(data_out, 1)
+        dst.set_band_description(1, "SO2 vertical column")
+        dst.update_tags(
+            1,
+            units="mol m-2",
+            source="Sentinel-5P TROPOMI L2 -> HARP bin_spatial",
+            qa_filter="validity >= 50; SO2_type != 4",
+        )
+
+    print("\n====================================")
+    print("GEOTIFF GENERADO")
+    print("====================================")
+    print(salida_tif)
+
+    return salida_tif
+
+
+# ============================================================
+# PLOT
+# ============================================================
+
+def dibujar_shape(ax, geom):
+    if geom.geom_type == "Polygon":
+        x, y = geom.exterior.xy
+        ax.plot(x, y, color="black", linewidth=1.4, zorder=20)
+
+    elif geom.geom_type == "MultiPolygon":
+        for poly in geom.geoms:
+            x, y = poly.exterior.xy
+            ax.plot(x, y, color="black", linewidth=1.4, zorder=20)
+
+
+def graficar(
+    ruta_harp,
+    fecha_tag,
+    geom,
+    bounds,
+):
+    lon, lat, z, units = leer_harp_l3(ruta_harp)
+
+    z = rellenar_huecos(lon, lat, z)
+
+    guardar_geotiff(
+        lon=lon,
+        lat=lat,
+        z=z,
+        fecha_tag=fecha_tag,
+    )
+
+    valid = z[np.isfinite(z)]
+
+    if valid.size == 0:
+        raise RuntimeError(
+            "El bin_spatial no produjo datos SO2 validos en la region."
+        )
+
+    # SO2 puede tener ruido negativo; para visualizacion lo dejamos en 0.
+    z_plot = np.array(z, copy=True)
+    z_plot[z_plot < 0] = 0.0
+
+    positivos = z_plot[
+        np.isfinite(z_plot)
+    ]
+
+    # PRUEBA 3:
+    # NO estirar la escala con percentiles.
+    # Usamos una escala fija 0-0.01 mol/m^2, como en las primeras
+    # visualizaciones y mucho menos sensible al ruido de fondo.
+    vmax = 0.01
+
+    X, Y = np.meshgrid(lon, lat)
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Raster L3 real. pcolormesh respeta la malla HARP y evita
+    # triangulaciones/contornos artificiales entre celdas.
+    z_plot = np.ma.masked_invalid(z_plot)
+
+    cf = ax.pcolormesh(
+        X,
+        Y,
+        z_plot,
+        cmap="jet",
+        vmin=0.0,
+        vmax=vmax,
+        shading="nearest",
+        rasterized=True,
+        zorder=10,
+    )
+
+    cbar = fig.colorbar(cf, ax=ax, pad=0.025)
+    cbar.set_label(
+        f"SO$_2$ vertical column ({units})"
+    )
+
+    dibujar_shape(ax, geom)
+
+    ax.scatter(
+        VILLARRICA_LON,
+        VILLARRICA_LAT,
+        marker="^",
+        s=130,
+        color="deepskyblue",
+        edgecolor="black",
+        linewidth=1.0,
+        label="Villarrica",
+        zorder=30,
+    )
+
+    minx, miny, maxx, maxy = bounds
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+
+    ax.set_xlabel("Longitud")
+    ax.set_ylabel("Latitud")
+    ax.set_title(
+        f"Sentinel-5P SO$_2$ | HARP L2 -> L3 | escala 0-0.01 | {fecha_tag}"
+    )
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.20)
+
+    out_dir = OUT_SO2 / fecha_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    salida = (
+        out_dir
+        / f"SO2_HARP_L3_ESCALA_FIJA_{fecha_tag}.png"
+    )
+
+    plt.tight_layout()
+    plt.savefig(
+        salida,
+        dpi=250,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    print("\n====================================")
+    print("PNG GENERADO")
+    print("====================================")
+    print(salida)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
-    producto = buscar_producto_so2_mas_reciente()
+def main(fecha=None, hora=None):
+    """
+    Compatible con tu main.py actual:
+        sentinel5p.main(fecha=args.fecha, hora=args.hora)
+
+    Sin --fecha:
+        usa la fecha L2 mas reciente y junta todos los swaths del dia.
+
+    --fecha YYYY-MM-DD:
+        junta todos los swaths del dia.
+
+    --fecha YYYY-MM-DD --hora HH:
+        usa el swath mas cercano a esa hora.
+    """
+
+    geom, bounds = cargar_zona_estudio()
+
+    productos = seleccionar_productos(
+        fecha=fecha,
+        hora=hora,
+        bounds=bounds,
+    )
+
+    if not productos:
+        raise RuntimeError("No se encontraron productos L2.")
+
     token = obtener_token()
-    archivo_nc = descargar_producto(producto, token)
 
-    procesar_archivo_s5p(archivo_nc)
+    archivos = [
+        descargar_producto(p, token)
+        for p in productos
+    ]
 
-    limpiar_nc_viejos()
+    if fecha is not None:
+        fecha_tag = fecha
+        if hora is not None:
+            fecha_tag += f"_H{hora:02d}"
+    else:
+        fecha_tag = fecha_producto(productos[0]).strftime(
+            "%Y-%m-%d"
+        )
 
-    print("\nProceso Sentinel-5P SO2 terminado.")
-    print("RAW_S5P:", RAW_S5P)
-    print("OUT_SO2:", OUT_SO2)
+    harp_l3 = convertir_con_harp(
+        archivos_l2=archivos,
+        bounds=bounds,
+        fecha_tag=fecha_tag.replace(":", "-"),
+    )
+
+    graficar(
+        ruta_harp=harp_l3,
+        fecha_tag=fecha_tag,
+        geom=geom,
+        bounds=bounds,
+    )
+
+    print("\nProceso terminado.")
+    print("L2:", RAW_S5P)
+    print("L3 HARP:", harp_l3)
+    print("PNG:", OUT_SO2)
 
 
 if __name__ == "__main__":
