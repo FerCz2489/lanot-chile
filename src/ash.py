@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 import csv
+import shutil
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -23,18 +24,22 @@ from config import RAW_GOES, OUT_RGB_ASH
 INPUT_BASE = RAW_GOES
 OUTPUT_BASE = OUT_RGB_ASH
 
-# Producto ABI Full Disk usado por este flujo.
+# Productos GOES que deben conservarse para cada evento.
+# RADF y CMIPF existen por canal C01-C16.
+# ACTPF es un producto L2 derivado y NO está dividido por canal.
 PRODUCTOS_GOES = [
+    "ABI-L1b-RadF",
+    "ABI-L2-ACTPF",
     "ABI-L2-CMIPF",
 ]
 
-PRODUCTO_RGB = "ABI-L2-CMIPF"
+BANDAS_ABI = [f"C{i:02d}" for i in range(1, 17)]
 
-# Bandas necesarias para los RGB volcánicos.
-BANDAS_DESCARGA = ["C07", "C11", "C13", "C14", "C15"]
+# Los RGB de ceniza se construyen a partir de CMIPF.
+PRODUCTO_RGB = "ABI-L2-CMIPF"
 BANDAS_RGB = ["C07", "C11", "C13", "C14", "C15"]
 
-# Genera un NAV.nc por volcán/fecha tomando C13 como referencia.
+# Genera un NAV.nc por volcán/fecha tomando C13 de CMIPF como referencia.
 GENERAR_NAV_NC = True
 BANDA_NAV = "C13"
 
@@ -188,6 +193,7 @@ def horas_evento(evento):
         hi = hf
 
     if hf < hi:
+        # Se mantiene el comportamiento histórico: desde hora_inicio hasta 23 UTC.
         return list(range(hi, 24))
 
     return list(range(hi, hf + 1))
@@ -201,14 +207,11 @@ def eventos_por_volcan_fecha(eventos):
         for h in horas_evento(ev):
             salida[key].add(h)
 
-    return {
-        key: sorted(horas)
-        for key, horas in salida.items()
-    }
+    return {key: sorted(horas) for key, horas in salida.items()}
 
 
 # ==========================================================
-# AWS S3
+# AWS S3 / NOMBRES NOAA
 # ==========================================================
 
 def fecha_a_juliano(fecha):
@@ -217,12 +220,31 @@ def fecha_a_juliano(fecha):
 
 
 def obtener_bucket_goes(fecha):
+    """
+    Decide automáticamente qué bucket usar según la fecha del evento.
+
+    Para eventos históricos se usa GOES-16.
+    Para fechas posteriores al relevo operacional de GOES-East se usa GOES-19.
+    """
     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
     cambio_goes19 = datetime(2025, 4, 7)
 
     if fecha_dt < cambio_goes19:
         return "noaa-goes16"
+
     return "noaa-goes19"
+
+
+def producto_tiene_bandas(producto):
+    return producto in {"ABI-L1b-RadF", "ABI-L2-CMIPF"}
+
+
+def variable_principal(producto):
+    if producto == "ABI-L1b-RadF":
+        return "Rad"
+    if producto == "ABI-L2-CMIPF":
+        return "CMI"
+    return None
 
 
 def extraer_banda(path):
@@ -250,32 +272,60 @@ def extraer_datetime(path):
     return dt.replace(hour=hour, minute=minute, second=second)
 
 
-def descargar_archivos_evento(s3, bucket, producto, fecha, horas_utc, destino_tmp):
-    """Descarga los originales NOAA requeridos para un volcán/fecha en un temporal."""
+def listar_objetos_prefix(s3, bucket, prefix):
+    """Itera sobre TODOS los objetos de un prefix, incluyendo paginación S3."""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield obj
+
+
+def descargar_archivos_producto(
+    s3,
+    bucket,
+    producto,
+    fecha,
+    horas_utc,
+    destino_tmp,
+):
+    """
+    Descarga originales NOAA para un producto.
+
+    RADF/CMIPF: conserva C01-C16.
+    ACTPF: conserva todos los archivos del producto, ya que no está dividido por canal.
+    """
     year, jday = fecha_a_juliano(fecha)
+    destino_tmp = Path(destino_tmp)
     destino_tmp.mkdir(parents=True, exist_ok=True)
 
-    descargados = defaultdict(list)
+    if producto_tiene_bandas(producto):
+        descargados = defaultdict(list)
+    else:
+        descargados = []
 
     for hour in horas_utc:
         prefix = f"{producto}/{year}/{jday:03d}/{hour:02d}/"
         print(f"\nBuscando s3://{bucket}/{prefix}")
 
         try:
-            resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+            objetos = list(listar_objetos_prefix(s3, bucket, prefix))
         except Exception as e:
-            print(f"Error AWS: {e}")
+            print(f"Error AWS en {producto}: {e}")
             continue
 
-        for obj in resp.get("Contents", []):
+        for obj in objetos:
             key = obj["Key"]
             nombre = Path(key).name
-            banda = extraer_banda(nombre)
 
-            if banda not in BANDAS_DESCARGA:
-                continue
+            if producto_tiene_bandas(producto):
+                banda = extraer_banda(nombre)
+                if banda not in BANDAS_ABI:
+                    continue
+                out_dir = destino_tmp / producto / banda
+            else:
+                banda = None
+                out_dir = destino_tmp / producto
 
-            out_dir = destino_tmp / banda
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / nombre
 
@@ -284,57 +334,92 @@ def descargar_archivos_evento(s3, bucket, producto, fecha, horas_utc, destino_tm
                 try:
                     s3.download_file(bucket, key, str(out_path))
                 except Exception as e:
-                    print(f"Error descarga: {e}")
+                    print(f"Error descarga {nombre}: {e}")
                     continue
 
-            descargados[banda].append(out_path)
+            if banda is None:
+                descargados.append(out_path)
+            else:
+                descargados[banda].append(out_path)
 
-    for banda in descargados:
-        descargados[banda] = sorted(set(descargados[banda]))
+    if producto_tiene_bandas(producto):
+        for banda in descargados:
+            descargados[banda] = sorted(set(descargados[banda]))
+    else:
+        descargados = sorted(set(descargados))
 
     return descargados
 
 
 # ==========================================================
-# RECORTE Y COMBINACIÓN DIARIA
+# RECORTE GEOESTACIONARIO
 # ==========================================================
 
-def recortar_goes_da(da, ds, bbox):
+def limites_xy_goes(ds, bbox):
     lon_min, lat_min, lon_max, lat_max = bbox
 
+    if "goes_imager_projection" not in ds:
+        raise ValueError("El archivo no contiene goes_imager_projection")
+
     proj_attrs = ds["goes_imager_projection"].attrs
-    h = proj_attrs["perspective_point_height"]
+    h = float(proj_attrs["perspective_point_height"])
 
     crs_goes = CRS.from_cf(proj_attrs)
     crs_geo = CRS.from_epsg(4326)
+    transformer = Transformer.from_crs(crs_geo, crs_goes, always_xy=True)
 
-    transformer = Transformer.from_crs(
-        crs_geo,
-        crs_goes,
-        always_xy=True,
-    )
+    # Transformar las cuatro esquinas, no sólo una diagonal.
+    esquinas = [
+        (lon_min, lat_min),
+        (lon_min, lat_max),
+        (lon_max, lat_min),
+        (lon_max, lat_max),
+    ]
+    xy = [transformer.transform(lon, lat) for lon, lat in esquinas]
+    xs = [p[0] / h for p in xy]
+    ys = [p[1] / h for p in xy]
 
-    x1, y1 = transformer.transform(lon_min, lat_min)
-    x2, y2 = transformer.transform(lon_max, lat_max)
+    return min(xs), max(xs), min(ys), max(ys)
 
-    x_min = min(x1, x2) / h
-    x_max = max(x1, x2) / h
-    y_min = min(y1, y2) / h
-    y_max = max(y1, y2) / h
+
+def recortar_goes_da(da, ds, bbox):
+    x_min, x_max, y_min, y_max = limites_xy_goes(ds, bbox)
+
+    if "x" not in da.dims or "y" not in da.dims:
+        return da
 
     if da.y[0] > da.y[-1]:
-        return da.sel(
-            x=slice(x_min, x_max),
-            y=slice(y_max, y_min),
-        )
+        return da.sel(x=slice(x_min, x_max), y=slice(y_max, y_min))
 
-    return da.sel(
-        x=slice(x_min, x_max),
-        y=slice(y_min, y_max),
-    )
+    return da.sel(x=slice(x_min, x_max), y=slice(y_min, y_max))
 
 
-def construir_dataset_banda(archivos, banda, bbox):
+def recortar_dataset_goes(ds, bbox):
+    """Recorta un Dataset conservando sus variables; útil para ACTPF."""
+    x_min, x_max, y_min, y_max = limites_xy_goes(ds, bbox)
+
+    if "x" not in ds.coords or "y" not in ds.coords:
+        return ds
+
+    if ds["y"][0] > ds["y"][-1]:
+        return ds.sel(x=slice(x_min, x_max), y=slice(y_max, y_min))
+
+    return ds.sel(x=slice(x_min, x_max), y=slice(y_min, y_max))
+
+
+# ==========================================================
+# PRODUCTOS POR CANAL: RADF / CMIPF
+# ==========================================================
+
+def construir_dataset_banda(archivos, producto, banda, bbox):
+    """
+    Combina escenas de una banda en el tiempo.
+
+    RADF  -> variable Rad renombrada Cxx.
+    CMIPF -> variable CMI renombrada Cxx.
+    DQF se conserva cuando está disponible.
+    """
+    var_fuente = variable_principal(producto)
     escenas = []
     referencia_attrs = None
     referencia_proj = None
@@ -345,19 +430,23 @@ def construir_dataset_banda(archivos, banda, bbox):
             continue
 
         with xr.open_dataset(archivo) as ds:
-            if "CMI" not in ds:
+            if var_fuente not in ds:
+                print(f"Aviso: {Path(archivo).name} no contiene {var_fuente}")
                 continue
 
-            da = ds["CMI"].astype(np.float32)
-            da = recortar_goes_da(da, ds, bbox).load()
+            data_vars = {}
 
-            if da.size == 0:
+            principal = recortar_goes_da(ds[var_fuente], ds, bbox).load()
+            if principal.size == 0:
                 continue
+            data_vars[banda] = principal.astype(np.float32)
 
-            da = da.expand_dims(time=[np.datetime64(dt)])
-            da.name = banda
+            if "DQF" in ds and {"x", "y"}.issubset(ds["DQF"].dims):
+                data_vars["DQF"] = recortar_goes_da(ds["DQF"], ds, bbox).load()
 
-            escenas.append(da)
+            escena = xr.Dataset(data_vars=data_vars)
+            escena = escena.expand_dims(time=[np.datetime64(dt)])
+            escenas.append(escena)
 
             if referencia_attrs is None:
                 referencia_attrs = dict(ds.attrs)
@@ -366,31 +455,37 @@ def construir_dataset_banda(archivos, banda, bbox):
     if not escenas:
         return None
 
-    combinado = xr.concat(escenas, dim="time").sortby("time")
+    combinado = xr.concat(
+        escenas,
+        dim="time",
+        data_vars="all",
+        coords="minimal",
+        compat="override",
+        join="outer",
+    ).sortby("time")
 
-    ds_out = combinado.to_dataset(name=banda)
-    ds_out["goes_imager_projection"] = xr.DataArray(
+    combinado["goes_imager_projection"] = xr.DataArray(
         np.int32(0),
         attrs=referencia_proj or {},
     )
 
-    ds_out[banda].attrs["grid_mapping"] = "goes_imager_projection"
-    ds_out[banda].attrs["long_name"] = f"GOES ABI {banda} CMI"
-
-    ds_out.attrs.update(referencia_attrs or {})
-    ds_out.attrs.update({
-        "title": f"GOES ABI {banda} recortado y combinado por fecha",
+    combinado[banda].attrs["grid_mapping"] = "goes_imager_projection"
+    combinado[banda].attrs["source_variable"] = var_fuente
+    combinado[banda].attrs["source_product"] = producto
+    combinado.attrs.update(referencia_attrs or {})
+    combinado.attrs.update({
+        "title": f"{producto} {banda} recortado y combinado por fecha",
+        "product": producto,
         "band": banda,
     })
 
-    return ds_out
+    return combinado
 
 
-def guardar_banda_diaria(volcan, fecha, banda, ds_out):
-    out_dir = INPUT_BASE / volcan / fecha / banda
+def guardar_banda_diaria(volcan, fecha, producto, banda, ds_out):
+    out_dir = INPUT_BASE / volcan / fecha / producto / banda
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_path = out_dir / f"{banda}_{fecha}.nc"
+    out_path = out_dir / f"{producto}_{banda}_{fecha}.nc"
 
     encoding = {
         banda: {
@@ -402,64 +497,204 @@ def guardar_banda_diaria(volcan, fecha, banda, ds_out):
         }
     }
 
-    ds_out.to_netcdf(
-        out_path,
-        engine="netcdf4",
-        encoding=encoding,
-    )
+    if "DQF" in ds_out:
+        encoding["DQF"] = {
+            "zlib": True,
+            "complevel": 4,
+            "shuffle": True,
+        }
 
+    ds_out.to_netcdf(out_path, engine="netcdf4", encoding=encoding)
     print(f"Guardado: {out_path}")
     return out_path
 
 
+# ==========================================================
+# PRODUCTO SIN CANAL: ACTPF
+# ==========================================================
+
+def _vars_espaciales_actpf(ds):
+    """
+    Conserva todas las variables 2-D/espaciales dependientes de x,y del ACTPF.
+    Así no se codifica a mano un único nombre de variable del producto.
+    """
+    salida = []
+    for nombre, da in ds.data_vars.items():
+        if nombre == "goes_imager_projection":
+            continue
+        if {"x", "y"}.issubset(set(da.dims)):
+            salida.append(nombre)
+    return salida
+
+
+def construir_dataset_actpf(archivos, bbox):
+    escenas = []
+    referencia_attrs = None
+    referencia_proj = None
+    variables_encontradas = set()
+
+    for archivo in sorted(archivos):
+        dt = extraer_datetime(archivo)
+        if dt is None:
+            continue
+
+        with xr.open_dataset(archivo) as ds:
+            rec = recortar_dataset_goes(ds, bbox)
+            nombres = _vars_espaciales_actpf(rec)
+
+            if not nombres:
+                print(f"Aviso: ACTPF sin variables espaciales en {Path(archivo).name}")
+                continue
+
+            escena_vars = {}
+            for nombre in nombres:
+                da = rec[nombre].load()
+                if np.issubdtype(da.dtype, np.floating):
+                    da = da.astype(np.float32)
+                escena_vars[nombre] = da
+                variables_encontradas.add(nombre)
+
+            escena = xr.Dataset(data_vars=escena_vars)
+            escena = escena.expand_dims(time=[np.datetime64(dt)])
+            escenas.append(escena)
+
+            if referencia_attrs is None:
+                referencia_attrs = dict(ds.attrs)
+                referencia_proj = dict(ds["goes_imager_projection"].attrs)
+
+    if not escenas:
+        return None
+
+    combinado = xr.concat(
+        escenas,
+        dim="time",
+        data_vars="all",
+        coords="minimal",
+        compat="override",
+        join="outer",
+    ).sortby("time")
+
+    combinado["goes_imager_projection"] = xr.DataArray(
+        np.int32(0), attrs=referencia_proj or {}
+    )
+    combinado.attrs.update(referencia_attrs or {})
+    combinado.attrs.update({
+        "title": "ABI-L2-ACTPF recortado y combinado por fecha",
+        "product": "ABI-L2-ACTPF",
+        "spatial_variables_preserved": ", ".join(sorted(variables_encontradas)),
+    })
+
+    return combinado
+
+
+def guardar_actpf_diario(volcan, fecha, ds_out):
+    producto = "ABI-L2-ACTPF"
+    out_dir = INPUT_BASE / volcan / fecha / producto
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{producto}_{fecha}.nc"
+
+    encoding = {}
+    for nombre, da in ds_out.data_vars.items():
+        if nombre == "goes_imager_projection":
+            continue
+        enc = {"zlib": True, "complevel": 4, "shuffle": True}
+        if np.issubdtype(da.dtype, np.floating):
+            enc.update({"dtype": "float32", "_FillValue": np.float32(-9999.0)})
+        encoding[nombre] = enc
+
+    ds_out.to_netcdf(out_path, engine="netcdf4", encoding=encoding)
+    print(f"Guardado: {out_path}")
+    return out_path
+
+
+# ==========================================================
+# DESCARGA / PROCESAMIENTO DE LOS TRES PRODUCTOS
+# ==========================================================
+
 def procesar_descarga_evento(s3, volcan, fecha, horas_utc, bbox):
     bucket = obtener_bucket_goes(fecha)
-    producto = PRODUCTOS_GOES[0]
 
     print("\n====================================")
     print(f"VOLCÁN: {volcan}")
     print(f"FECHA:  {fecha}")
     print(f"BUCKET: {bucket}")
+    print("PRODUCTOS:", ", ".join(PRODUCTOS_GOES))
     print("====================================")
 
     tmp_base = INPUT_BASE / ".tmp_goes" / volcan / fecha
+    resultados = defaultdict(dict)
 
-    descargados = descargar_archivos_evento(
-        s3=s3,
-        bucket=bucket,
-        producto=producto,
-        fecha=fecha,
-        horas_utc=horas_utc,
-        destino_tmp=tmp_base,
-    )
+    try:
+        for producto in PRODUCTOS_GOES:
+            print(f"\n========== {producto} ==========")
 
-    resultados = {}
-
-    for banda in BANDAS_DESCARGA:
-        archivos = descargados.get(banda, [])
-
-        if not archivos:
-            print(f"Sin archivos para {banda}")
-            continue
-
-        print(f"\nCombinando {banda}: {len(archivos)} escenas")
-        ds_out = construir_dataset_banda(archivos, banda, bbox)
-
-        if ds_out is None:
-            print(f"No se pudo construir {banda}")
-            continue
-
-        try:
-            resultados[banda] = guardar_banda_diaria(
-                volcan=volcan,
+            descargados = descargar_archivos_producto(
+                s3=s3,
+                bucket=bucket,
+                producto=producto,
                 fecha=fecha,
-                banda=banda,
-                ds_out=ds_out,
+                horas_utc=horas_utc,
+                destino_tmp=tmp_base,
             )
-        finally:
-            ds_out.close()
 
-    return resultados
+            if producto_tiene_bandas(producto):
+                for banda in BANDAS_ABI:
+                    archivos = descargados.get(banda, [])
+                    if not archivos:
+                        print(f"Sin archivos para {producto} {banda}")
+                        continue
+
+                    print(
+                        f"Combinando {producto} {banda}: "
+                        f"{len(archivos)} escenas"
+                    )
+                    ds_out = construir_dataset_banda(
+                        archivos=archivos,
+                        producto=producto,
+                        banda=banda,
+                        bbox=bbox,
+                    )
+                    if ds_out is None:
+                        print(f"No se pudo construir {producto} {banda}")
+                        continue
+
+                    try:
+                        resultados[producto][banda] = guardar_banda_diaria(
+                            volcan=volcan,
+                            fecha=fecha,
+                            producto=producto,
+                            banda=banda,
+                            ds_out=ds_out,
+                        )
+                    finally:
+                        ds_out.close()
+
+            else:
+                if not descargados:
+                    print(f"Sin archivos para {producto}")
+                    continue
+
+                print(f"Combinando {producto}: {len(descargados)} escenas")
+                ds_out = construir_dataset_actpf(descargados, bbox)
+                if ds_out is None:
+                    print(f"No se pudo construir {producto}")
+                    continue
+
+                try:
+                    resultados[producto]["ACTPF"] = guardar_actpf_diario(
+                        volcan=volcan,
+                        fecha=fecha,
+                        ds_out=ds_out,
+                    )
+                finally:
+                    ds_out.close()
+
+    finally:
+        # Los originales NOAA son temporales: el producto diario recortado queda en RAW_GOES.
+        if tmp_base.exists():
+            shutil.rmtree(tmp_base, ignore_errors=True)
+
+    return dict(resultados)
 
 
 # ==========================================================
@@ -477,12 +712,7 @@ def calcular_latlon_goes(ds):
 
     crs_goes = CRS.from_cf(proj_attrs)
     crs_geo = CRS.from_epsg(4326)
-
-    transformer = Transformer.from_crs(
-        crs_goes,
-        crs_geo,
-        always_xy=True,
-    )
+    transformer = Transformer.from_crs(crs_goes, crs_geo, always_xy=True)
 
     x = np.asarray(ds["x"].values, dtype=np.float64) * h
     y = np.asarray(ds["y"].values, dtype=np.float64) * h
@@ -544,6 +774,8 @@ def generar_nav_nc(volcan, fecha, archivo_referencia):
                 "title": "GOES ABI navigation latitude/longitude",
                 "volcan": volcan,
                 "date": fecha,
+                "source_product": PRODUCTO_RGB,
+                "source_band": BANDA_NAV,
                 "source_file": Path(archivo_referencia).name,
             },
         )
@@ -563,18 +795,14 @@ def generar_nav_nc(volcan, fecha, archivo_referencia):
             },
         }
 
-        nav_ds.to_netcdf(
-            out_nav,
-            engine="netcdf4",
-            encoding=encoding,
-        )
+        nav_ds.to_netcdf(out_nav, engine="netcdf4", encoding=encoding)
         nav_ds.close()
 
     return out_nav
 
 
 # ==========================================================
-# RGB
+# RGB DE CENIZA
 # ==========================================================
 
 def normalizar(data, vmin=None, vmax=None):
@@ -591,40 +819,40 @@ def normalizar(data, vmin=None, vmax=None):
 
 
 def crear_rgbs(c07, c11, c13, c14, c15):
+    # NOAA/NASA
     rNOAA = c15 - c13
     gNOAA = c14 - c11
     bNOAA = c13
-
     rgbNOAA = np.dstack([
         normalizar(rNOAA, -6.7, 2.6),
         normalizar(gNOAA, -6.0, 6.3),
         normalizar(bNOAA, 243.6, 302.4),
     ])
 
+    # HOTVOLC
     rHOTVOLC = c13 - c15
     gHOTVOLC = c13 - c11
     bHOTVOLC = c13
-
     rgbHOTVOLC = np.dstack([
         normalizar(rHOTVOLC),
         normalizar(gHOTVOLC),
         normalizar(bHOTVOLC),
     ])
 
+    # Composición espectral asociada al enfoque CNN consultado.
     rCNN = c15 - c13
     gCNN = c13 - c11
     bCNN = c13
-
     rgbCNN = np.dstack([
         normalizar(rCNN, -4, 2),
         normalizar(gCNN, -4, 5),
         normalizar(bCNN, 243, 303),
     ])
 
+    # Microfísica/Pavolonis: conserva C07 para la diferencia C13-C07.
     rMICRO = c15 - c13
     gMICRO = c13 - c07
     bMICRO = c13
-
     rgbMICRO = np.dstack([
         normalizar(rMICRO),
         normalizar(gMICRO),
@@ -639,11 +867,22 @@ def crear_rgbs(c07, c11, c13, c14, c15):
     }
 
 
+def ruta_banda_diaria(volcan, fecha, banda):
+    return (
+        INPUT_BASE
+        / volcan
+        / fecha
+        / PRODUCTO_RGB
+        / banda
+        / f"{PRODUCTO_RGB}_{banda}_{fecha}.nc"
+    )
+
+
 def cargar_bandas_diarias(volcan, fecha):
     datasets = {}
 
     for banda in BANDAS_RGB:
-        ruta = INPUT_BASE / volcan / fecha / banda / f"{banda}_{fecha}.nc"
+        ruta = ruta_banda_diaria(volcan, fecha, banda)
         if not ruta.exists():
             for ds in datasets.values():
                 ds.close()
@@ -665,7 +904,6 @@ def guardar_rgb(
     lon_min, lat_min, lon_max, lat_max = bbox
 
     fig, ax = plt.subplots(figsize=(8, 8))
-
     ax.imshow(
         rgb,
         extent=[lon_min, lon_max, lat_min, lat_max],
@@ -706,7 +944,10 @@ def procesar_rgb_evento(volcan, fecha, info, horas_permitidas):
     datasets = cargar_bandas_diarias(volcan, fecha)
 
     if datasets is None:
-        print(f"Faltan bandas diarias para RGB: {volcan} {fecha}")
+        print(
+            f"Faltan bandas {PRODUCTO_RGB} necesarias para RGB: "
+            f"{volcan} {fecha}"
+        )
         return
 
     try:
@@ -725,7 +966,9 @@ def procesar_rgb_evento(volcan, fecha, info, horas_permitidas):
             for banda in BANDAS_RGB:
                 da = datasets[banda][banda]
                 idx = np.argmin(np.abs(da["time"].values - np.datetime64(dt)))
-                valores[banda] = np.asarray(da.isel(time=idx).values, dtype=float)
+                valores[banda] = np.asarray(
+                    da.isel(time=idx).values, dtype=float
+                )
 
             rgbs = crear_rgbs(
                 valores["C07"],
@@ -824,11 +1067,16 @@ def run(
                 bbox=info["bbox"],
             )
 
-            if GENERAR_NAV_NC and BANDA_NAV in resultados:
+            archivo_nav = (
+                resultados
+                .get(PRODUCTO_RGB, {})
+                .get(BANDA_NAV)
+            )
+            if GENERAR_NAV_NC and archivo_nav:
                 generar_nav_nc(
                     volcan=nombre_volcan,
                     fecha=fecha_evento,
-                    archivo_referencia=resultados[BANDA_NAV],
+                    archivo_referencia=archivo_nav,
                 )
 
         if modo in {"todo", "rgb"}:
@@ -848,7 +1096,10 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Pipeline GOES para descarga, combinación diaria y RGB de ceniza."
+        description=(
+            "Pipeline GOES: descarga RADF/ACTPF/CMIPF, conserva C01-C16 "
+            "donde aplica, combina por fecha y genera RGB de ceniza."
+        )
     )
 
     parser.add_argument(
