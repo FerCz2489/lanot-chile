@@ -1,23 +1,21 @@
 Bootstrap: docker
-From: python:3.11-slim
+From: continuumio/miniconda3:latest
 
 %files
     requirements.txt /opt/requirements.txt
 
 %post
-    apt update && apt install -y \
-        g++ \
-        gcc \
-        libproj-dev \
-        proj-data \
-        proj-bin \
-        libnetcdf-dev \
-        libhdf5-dev \
-        git \
-        && apt clean
+    conda install -y -c conda-forge \
+        python=3.11 \
+        harp \
+        pip
 
-    pip install --no-cache-dir --upgrade pip
     pip install --no-cache-dir -r /opt/requirements.txt
+
+    conda clean -afy
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
 
 %runscript
     exec python "$@"
