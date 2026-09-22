@@ -34,7 +34,8 @@ TOKEN_URL = (
 )
 
 COLLECTION = "SENTINEL-5P"
-NAME_CONTAINS = "S5P_NRTI_L2__SO2"
+NAME_NRTI = "S5P_NRTI_L2__SO2"
+NAME_OFFL = "S5P_OFFL_L2__SO2"
 
 SRC_DIR = Path(__file__).resolve().parent
 BASE_DIR = SRC_DIR.parent
@@ -194,14 +195,14 @@ def obtener_token():
     return r.json()["access_token"]
 
 
-def buscar_productos(inicio, fin, bounds, top=100):
+def buscar_productos(inicio, fin, bounds, top=100, name_contains=NAME_NRTI):
     ini = inicio.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     end = fin.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     wkt = bbox_wkt(bounds)
 
     filtro = (
         f"Collection/Name eq '{COLLECTION}' "
-        f"and contains(Name,'{NAME_CONTAINS}') "
+        f"and contains(Name,'{name_contains}') "
         f"and ContentDate/Start ge {ini} "
         f"and ContentDate/Start le {end} "
         f"and OData.CSC.Intersects("
@@ -226,6 +227,21 @@ def fecha_producto(producto):
     )
 
 
+def buscar_productos_fecha(inicio, fin, bounds, top=100):
+    """Para fechas explicitas prioriza OFFL; NRTI queda como respaldo."""
+    print("\nBuscando Sentinel-5P SO2 OFFL...")
+    productos = buscar_productos(inicio, fin, bounds, top=top, name_contains=NAME_OFFL)
+    if productos:
+        print("Producto usado: OFFL")
+        return productos
+
+    print("No encontre OFFL. Intentando NRTI...")
+    productos = buscar_productos(inicio, fin, bounds, top=top, name_contains=NAME_NRTI)
+    if productos:
+        print("Producto usado: NRTI")
+    return productos
+
+
 def seleccionar_productos(fecha, hora, bounds):
     """
     Sin fecha:
@@ -241,7 +257,7 @@ def seleccionar_productos(fecha, hora, bounds):
         inicio = ahora - timedelta(days=SEARCH_DAYS_BACK)
 
         encontrados = buscar_productos(
-            inicio, ahora, bounds, top=100
+            inicio, ahora, bounds, top=100, name_contains=NAME_NRTI
         )
 
         if not encontrados:
@@ -255,7 +271,7 @@ def seleccionar_productos(fecha, hora, bounds):
         fin_dia = inicio_dia + timedelta(days=1)
 
         productos = buscar_productos(
-            inicio_dia, fin_dia, bounds, top=100
+            inicio_dia, fin_dia, bounds, top=100, name_contains=NAME_NRTI
         )
 
         print("\nFecha L2 mas reciente:", dia)
@@ -270,12 +286,12 @@ def seleccionar_productos(fecha, hora, bounds):
         )
         fin = inicio + timedelta(days=1)
 
-        productos = buscar_productos(
+        productos = buscar_productos_fecha(
             inicio, fin, bounds, top=100
         )
 
         if not productos:
-            raise RuntimeError(f"No hay L2 SO2 para {fecha}.")
+            raise RuntimeError(f"No hay L2 SO2 OFFL ni NRTI para {fecha} en esta region.")
 
         print("\nFecha solicitada:", fecha)
         print("Swaths encontrados:", len(productos))
@@ -286,7 +302,7 @@ def seleccionar_productos(fecha, hora, bounds):
         "%Y-%m-%d %H:%M:%S",
     ).replace(tzinfo=timezone.utc)
 
-    productos = buscar_productos(
+    productos = buscar_productos_fecha(
         objetivo - timedelta(hours=SEARCH_HOURS_AROUND),
         objetivo + timedelta(hours=SEARCH_HOURS_AROUND),
         bounds,
@@ -295,7 +311,7 @@ def seleccionar_productos(fecha, hora, bounds):
 
     if not productos:
         raise RuntimeError(
-            f"No hay L2 SO2 cerca de {fecha} {hora:02d}:00 UTC."
+            f"No hay L2 SO2 OFFL ni NRTI cerca de {fecha} {hora:02d}:00 UTC."
         )
 
     elegido = min(
