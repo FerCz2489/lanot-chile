@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import os
+import csv
 import subprocess
 
 import requests
@@ -36,7 +37,9 @@ COLLECTION = "SENTINEL-5P"
 NAME_CONTAINS = "S5P_NRTI_L2__SO2"
 
 SRC_DIR = Path(__file__).resolve().parent
+BASE_DIR = SRC_DIR.parent
 SHAPE_ESTUDIO = SRC_DIR / "campo villarrica.shp"
+VOLCANES_CSV = BASE_DIR / "data" / "eventos" / "volcanes.csv"
 
 VILLARRICA_LAT = -39.420
 VILLARRICA_LON = -71.930
@@ -114,6 +117,44 @@ def cargar_zona_estudio():
     print("Bounds mapa:", bounds_mapa)
 
     return geom, bounds_mapa
+
+
+def cargar_volcan_csv(nombre_volcan):
+    """
+    Añadido opcional: busca un volcan en data/eventos/volcanes.csv.
+    Si no se usa --volcan, el flujo normal sigue usando el shapefile.
+    """
+    if not VOLCANES_CSV.exists():
+        raise FileNotFoundError(f"No existe: {VOLCANES_CSV}")
+
+    buscado = nombre_volcan.strip().casefold()
+
+    with open(VOLCANES_CSV, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["volcan"].strip().casefold() == buscado:
+                nombre = row["volcan"].strip()
+                lat = float(row["lat"])
+                lon = float(row["lon"])
+                bounds = (
+                    float(row["lon_min"]),
+                    float(row["lat_min"]),
+                    float(row["lon_max"]),
+                    float(row["lat_max"]),
+                )
+
+                print("\n====================================")
+                print("ZONA DE ESTUDIO DESDE volcanes.csv")
+                print("====================================")
+                print("Volcan:", nombre)
+                print("Centro:", lon, lat)
+                print("Bounds mapa:", bounds)
+
+                return nombre, lat, lon, bounds
+
+    raise ValueError(
+        f"No encontre el volcan '{nombre_volcan}' en {VOLCANES_CSV}"
+    )
 
 
 def bbox_wkt(bounds):
@@ -676,6 +717,9 @@ def graficar(
     fecha_tag,
     geom,
     bounds,
+    nombre_volcan="Villarrica",
+    lat_volcan=VILLARRICA_LAT,
+    lon_volcan=VILLARRICA_LON,
 ):
     lon, lat, z, units = leer_harp_l3(ruta_harp)
 
@@ -734,17 +778,18 @@ def graficar(
         f"SO$_2$ vertical column ({units})"
     )
 
-    dibujar_shape(ax, geom)
+    if geom is not None:
+        dibujar_shape(ax, geom)
 
     ax.scatter(
-        VILLARRICA_LON,
-        VILLARRICA_LAT,
+        lon_volcan,
+        lat_volcan,
         marker="^",
         s=130,
         color="deepskyblue",
         edgecolor="black",
         linewidth=1.0,
-        label="Villarrica",
+        label=nombre_volcan,
         zorder=30,
     )
 
@@ -786,7 +831,7 @@ def graficar(
 # MAIN
 # ============================================================
 
-def main(fecha=None, hora=None):
+def main(fecha=None, hora=None, volcan=None):
     """
     Compatible con tu main.py actual:
         sentinel5p.main(fecha=args.fecha, hora=args.hora)
@@ -801,7 +846,16 @@ def main(fecha=None, hora=None):
         usa el swath mas cercano a esa hora.
     """
 
-    geom, bounds = cargar_zona_estudio()
+    if volcan is None:
+        # Flujo original/default: usa el shapefile de Villarrica.
+        geom, bounds = cargar_zona_estudio()
+        nombre_volcan = "Villarrica"
+        lat_volcan = VILLARRICA_LAT
+        lon_volcan = VILLARRICA_LON
+    else:
+        # Añadido opcional: --volcan usa lat/lon/bbox de volcanes.csv.
+        nombre_volcan, lat_volcan, lon_volcan, bounds = cargar_volcan_csv(volcan)
+        geom = None
 
     productos = seleccionar_productos(
         fecha=fecha,
@@ -839,6 +893,9 @@ def main(fecha=None, hora=None):
         fecha_tag=fecha_tag,
         geom=geom,
         bounds=bounds,
+        nombre_volcan=nombre_volcan,
+        lat_volcan=lat_volcan,
+        lon_volcan=lon_volcan,
     )
 
     print("\nProceso terminado.")
