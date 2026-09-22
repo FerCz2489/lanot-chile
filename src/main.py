@@ -22,9 +22,12 @@ def correr_goes(
     )
 
 
-def correr_so2():
+def correr_so2(volcan=None, fecha=None):
     import sentinel5p
-    sentinel5p.main()
+    sentinel5p.main(
+        fecha=fecha,
+        volcan=volcan
+    )
 
 
 def main():
@@ -49,13 +52,16 @@ def main():
     parser.add_argument(
         "--volcan",
         default=None,
-        help="GOES: procesa solo un volcan, con el nombre usado en eventos.csv"
+        help=(
+            "Volcan a procesar. GOES usa eventos.csv; "
+            "SO2 usa volcanes.csv. Si se omite en SO2, usa el shapefile por defecto."
+        )
     )
 
     parser.add_argument(
         "--fecha",
         default=None,
-        help="GOES: procesa solo una fecha exacta: YYYY-MM-DD"
+        help="Fecha exacta YYYY-MM-DD. Aplica para GOES y Sentinel-5P SO2."
     )
 
     parser.add_argument(
@@ -97,7 +103,10 @@ def main():
         )
 
     elif args.producto == "so2":
-        correr_so2()
+        correr_so2(
+            volcan=args.volcan,
+            fecha=args.fecha
+        )
 
     elif args.producto == "todo":
         correr_goes(
@@ -109,7 +118,11 @@ def main():
             solo_sin_hora=args.solo_sin_hora,
             max_eventos=args.max_eventos
         )
-        correr_so2()
+
+        correr_so2(
+            volcan=args.volcan,
+            fecha=args.fecha
+        )
 
 
 if __name__ == "__main__":
