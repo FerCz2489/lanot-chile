@@ -1,0 +1,11 @@
+Mon Sep 28 01:59:22 PM CST 2026
+
+Crear un contenedor apptainer con base en lanot-chile def, que va  a hacer las siguientes tareas:
+
+- Descargar datos de sentinel5p nivel 2
+- Procesarlos con harp con el script sentinel5p.py
+- Correrlo diario para generar un geotiff 
+
+Requerimos la salida en una carpeta con acceso web
+
+Solo se guardaría el producto GeoTiff generado y se borrarían los datos descargados
