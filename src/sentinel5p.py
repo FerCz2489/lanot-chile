@@ -36,7 +36,7 @@ SRC_DIR = Path(__file__).resolve().parent
 BASE_DIR = SRC_DIR.parent
 SHAPE_ESTUDIO = SRC_DIR / "campo villarrica.shp"
 SHAPE_CHILE = SRC_DIR / "REGIONES" / "REGIONES_v1.shp"
-SHAPE_COMUNAS = SRC_DIR / "COMUNAS" / "COMUNAS_v1.shp"
+SHAPE_COMUNAS = SRC_DIR / "COMUNAS_v1.shp"
 def agregar_minimapa(ax, bounds, lon_volcan, lat_volcan):
     """Ubica claramente el dominio dentro de Chile."""
     if not SHAPE_CHILE.exists():
@@ -103,7 +103,7 @@ MARGEN_FRACCION = 0.08
 # Resolucion HARP en grados (~0.05 = ~5 km)
 RESOLUCION_GRADOS = 0.05
 # QA HARP: qa_value 0..1 pasa a validity 0..100
-QA_MIN_HARP = 50
+QA_MIN_HARP = 30  # QA 0.30; modificable mediante --qa
 # HARP SO2_type:
 # 0=no_detection, 1=so2_detected, 2=volcanic_detection,
 # 3=detection_near_anthropogenic_source, 4=detection_at_high_sza
@@ -117,7 +117,7 @@ SEARCH_HOURS_AROUND = 3
 PERCENTIL_VMAX = 99.5
 # Si quedan celdas sin observacion tras bin_spatial,
 # rellenarlas visualmente para evitar blanco.
-RELLENAR_HUECOS_VISUALES = True
+RELLENAR_HUECOS_VISUALES = False  # No inventar valores en celdas sin observaciones
 # ============================================================
 # SHAPE Y REGION
 # ============================================================
@@ -263,78 +263,46 @@ def obtener_intervalo_productos(productos):
     print("Fin:", fin.strftime("%Y-%m-%d %H:%M:%S UTC"))
     print("Texto para figura:", texto)
     return inicio, fin, texto
-def buscar_productos_fecha(inicio, fin, bounds, top=100):
-    """Para fechas explicitas usa NRTI como producto principal operativo."""
-    print("\nBuscando Sentinel-5P SO2 NRTI...")
-    productos = buscar_productos(inicio, fin, bounds, top=top, name_contains=NAME_NRTI)
-    if productos:
-        print("Producto usado: NRTI")
-    return productos
-def seleccionar_productos(fecha, hora, bounds):
-    """
-    Sin fecha:
-      toma todos los swaths de la fecha del producto mas reciente
-      que intersecta la region.
-    Con fecha:
-      si hora=None, toma todos los swaths de ese dia.
-      si hora se indica, toma el swath temporalmente mas cercano.
-    """
+def seleccionar_productos(fecha, hora, bounds, modo="NRTI"):
+    """Selecciona unicamente el tipo solicitado, sin fallback silencioso."""
+    modo = modo.upper()
+    nombres = {"NRTI": NAME_NRTI, "OFFL": NAME_OFFL, "RPRO": NAME_RPRO}
+    if modo not in nombres:
+        raise ValueError(f"Modo desconocido: {modo}")
+    patron = nombres[modo]
     if fecha is None:
+        if modo != "NRTI":
+            raise ValueError("Para OFFL/RPRO indica --fecha YYYY-MM-DD")
         ahora = datetime.now(timezone.utc)
-        inicio = ahora - timedelta(days=SEARCH_DAYS_BACK)
         encontrados = buscar_productos(
-            inicio, ahora, bounds, top=100, name_contains=NAME_NRTI
+            ahora - timedelta(days=SEARCH_DAYS_BACK), ahora,
+            bounds, top=100, name_contains=patron
         )
         if not encontrados:
-            raise RuntimeError("No encontre L2 SO2 reciente.")
-        dia = fecha_producto(encontrados[0]).date()
-        inicio_dia = datetime.combine(
-            dia, datetime.min.time(), tzinfo=timezone.utc
-        )
-        fin_dia = inicio_dia + timedelta(days=1)
-        productos = buscar_productos(
-            inicio_dia, fin_dia, bounds, top=100, name_contains=NAME_NRTI
-        )
-        print("\nFecha L2 mas reciente:", dia)
-        print("Swaths encontrados:", len(productos))
-        return productos
+            raise RuntimeError("No se encontraron productos NRTI recientes.")
+        fecha = fecha_producto(encontrados[0]).strftime("%Y-%m-%d")
     dia = datetime.strptime(fecha, "%Y-%m-%d").date()
-    if hora is None:
-        inicio = datetime.combine(
-            dia, datetime.min.time(), tzinfo=timezone.utc
-        )
-        fin = inicio + timedelta(days=1)
-        productos = buscar_productos_fecha(
-            inicio, fin, bounds, top=100
-        )
-        if not productos:
-            raise RuntimeError(f"No hay L2 SO2 NRTI para {fecha} en esta region.")
-        print("\nFecha solicitada:", fecha)
-        print("Swaths encontrados:", len(productos))
-        return productos
-    objetivo = datetime.strptime(
-        f"{fecha} {hora:02d}:00:00",
-        "%Y-%m-%d %H:%M:%S",
-    ).replace(tzinfo=timezone.utc)
-    productos = buscar_productos_fecha(
-        objetivo - timedelta(hours=SEARCH_HOURS_AROUND),
-        objetivo + timedelta(hours=SEARCH_HOURS_AROUND),
-        bounds,
-        top=100,
+    inicio = datetime.combine(dia, datetime.min.time(), tzinfo=timezone.utc)
+    fin = inicio + timedelta(days=1)
+    if hora is not None:
+        if not 0 <= hora <= 23:
+            raise ValueError("La hora debe estar entre 0 y 23 UTC")
+        objetivo = inicio + timedelta(hours=hora)
+        inicio = objetivo - timedelta(hours=SEARCH_HOURS_AROUND)
+        fin = objetivo + timedelta(hours=SEARCH_HOURS_AROUND)
+    productos = buscar_productos(
+        inicio, fin, bounds, top=100, name_contains=patron
     )
     if not productos:
-        raise RuntimeError(
-            f"No hay L2 SO2 NRTI cerca de {fecha} {hora:02d}:00 UTC."
-        )
-    elegido = min(
-        productos,
-        key=lambda p: abs(
+        raise RuntimeError(f"No se encontraron productos SO2 {modo} para {fecha} en esta region.")
+    if hora is not None:
+        productos = [min(productos, key=lambda p: abs(
             (fecha_producto(p) - objetivo).total_seconds()
-        ),
-    )
-    print("\nProducto mas cercano:", elegido["Name"])
-    print("Fecha:", elegido["ContentDate"]["Start"])
-    return [elegido]
+        ))]
+    print(f"Producto solicitado: {modo}; swaths: {len(productos)}")
+    return productos
+
+
 def descargar_producto(producto, token, max_intentos=5):
     """Descarga un L2 NRTI con reintentos ante cortes o errores HTTP temporales."""
     RAW_S5P.mkdir(parents=True, exist_ok=True)
@@ -782,7 +750,7 @@ def graficar(
     texto_hora=None,
 ):
     lon, lat, z, units = leer_harp_l3(ruta_harp)
-    z = rellenar_huecos(lon, lat, z)
+    # GeoTIFF conserva NaN donde no hay observacion.
     guardar_geotiff(
         lon=lon,
         lat=lat,
@@ -828,7 +796,8 @@ def graficar(
     )
     if geom is not None:
         dibujar_shape(ax, geom)
-    ax.scatter(
+    if lon_volcan is not None and lat_volcan is not None:
+        ax.scatter(
         lon_volcan,
         lat_volcan,
         marker="^",
@@ -869,7 +838,8 @@ def graficar(
         fontsize=14,
         fontweight="bold",
     )
-    ax.legend(
+    if lon_volcan is not None and lat_volcan is not None:
+        ax.legend(
         loc="upper right",
         frameon=True,
         facecolor="white",
@@ -897,7 +867,7 @@ def graficar(
 # ============================================================
 # MAIN
 # ============================================================
-def main(fecha=None, hora=None, volcan=None):
+def main(fecha=None, hora=None, volcan=None, modo="NRTI", qa=0.3):
     """
     Compatible con tu main.py actual:
         sentinel5p.main(fecha=args.fecha, hora=args.hora)
@@ -909,12 +879,16 @@ def main(fecha=None, hora=None, volcan=None):
         usa el swath mas cercano a esa hora.
     Como recordatorio, modificamos el plot a un área más amplia
     """
+    global QA_MIN_HARP
+    if not 0 <= qa <= 1:
+        raise ValueError("qa debe estar entre 0 y 1")
+    QA_MIN_HARP = round(qa * 100)
     if volcan is None:
-        # Flujo original/default: usa el shapefile de Villarrica.
+        # Area oficial del proyecto; no restringida al punto Villarrica.
         geom, bounds = cargar_zona_estudio()
-        nombre_volcan = "Villarrica"
-        lat_volcan = VILLARRICA_LAT
-        lon_volcan = VILLARRICA_LON
+        nombre_volcan = "Área de estudio LANOT-Chile"
+        lat_volcan = None
+        lon_volcan = None
     else:
         # Añadido opcional: --volcan usa lat/lon/bbox de volcanes.csv.
         nombre_volcan, lat_volcan, lon_volcan, bounds = cargar_volcan_csv(volcan)
@@ -923,6 +897,7 @@ def main(fecha=None, hora=None, volcan=None):
         fecha=fecha,
         hora=hora,
         bounds=bounds,
+        modo=modo,
     )
     if not productos:
         raise RuntimeError("No se encontraron productos L2.")
@@ -942,6 +917,7 @@ def main(fecha=None, hora=None, volcan=None):
         fecha_tag = fecha_producto(productos[0]).strftime(
             "%Y-%m-%d"
         )
+    fecha_tag = f"{fecha_tag}_{modo.upper()}_QA{QA_MIN_HARP:02d}"
     harp_l3 = convertir_con_harp(
         archivos_l2=archivos,
         bounds=bounds,
@@ -964,4 +940,13 @@ def main(fecha=None, hora=None, volcan=None):
     print("L3 HARP:", harp_l3)
     print("PNG:", OUT_SO2)
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Sentinel-5P SO2 LANOT")
+    parser.add_argument("--fecha", help="YYYY-MM-DD")
+    parser.add_argument("--hora", type=int, help="Hora UTC")
+    parser.add_argument("--volcan", help="Nombre en data/eventos/volcanes.csv")
+    parser.add_argument("--modo", choices=["NRTI", "OFFL", "RPRO"], default="NRTI")
+    parser.add_argument("--qa", type=float, default=0.3)
+    args = parser.parse_args()
+    main(fecha=args.fecha, hora=args.hora, volcan=args.volcan,
+         modo=args.modo, qa=args.qa)
